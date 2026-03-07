@@ -482,6 +482,19 @@ export class SLBridge {
     this._bodyYaw = targetYaw;
     this.applyBodyYaw();
 
+    // Determine desired altitude: fly above terrain, match target altitude near arrival
+    const terrainH = this.getTerrainHeight(Math.floor(myPos.x), Math.floor(myPos.y));
+    const minFlyAlt = terrainH + 10; // at least 10m above terrain
+    let desiredZ: number;
+    if (horizDist < 10) {
+      // Close to target — match their altitude
+      desiredZ = tPos.z;
+    } else {
+      // En route — fly above terrain, biased toward target altitude
+      desiredZ = Math.max(minFlyAlt, tPos.z);
+    }
+    const altDz = desiredZ - myPos.z;
+
     // Move forward + adjust altitude
     const agent = this.bot.agent;
     agent.clearControlFlag(
@@ -492,10 +505,10 @@ export class SLBridge {
 
     agent.setControlFlag(ControlFlags.AGENT_CONTROL_AT_POS);
 
-    // Fly up/down toward target altitude
-    if (dz > 2) {
+    // Fly up/down toward desired altitude
+    if (altDz > 2) {
       agent.setControlFlag(ControlFlags.AGENT_CONTROL_UP_POS);
-    } else if (dz < -2) {
+    } else if (altDz < -2) {
       agent.setControlFlag(ControlFlags.AGENT_CONTROL_UP_NEG);
     }
 

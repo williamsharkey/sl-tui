@@ -268,19 +268,28 @@ export function projectFrame(
   // 3. Avatar layer
   for (const av of avatars) {
     if (av.isSelf) continue;
-    const dz = Math.abs(av.z - selfZ);
-    if (dz >= 30) continue;
+    const dz = av.z - selfZ;
+    if (Math.abs(dz) >= 30) continue;
 
     const pos = simToGridRotated(av.x, av.y, params, cosY, sinY);
     if (!pos) continue;
 
     const ch = yawToDirectionChar(av.yaw);
     let fg = COLORS.avatar;
-    if (dz >= 10) fg = COLORS.faint;
-    else if (dz >= 3) fg = COLORS.dimmed;
+    if (Math.abs(dz) >= 10) fg = COLORS.faint;
+    else if (Math.abs(dz) >= 3) fg = COLORS.dimmed;
 
     const idx = pos.row * cols + pos.col;
     frame.cells[idx] = { char: ch, fg, bg: BG, oid: av.uuid };
+
+    // Altitude indicator: + above if significantly higher, - below if lower
+    if (dz > 5 && pos.row > 0) {
+      const aboveIdx = (pos.row - 1) * cols + pos.col;
+      frame.cells[aboveIdx] = { char: '+', fg, bg: BG, oid: av.uuid };
+    } else if (dz < -5 && pos.row < rows - 1) {
+      const belowIdx = (pos.row + 1) * cols + pos.col;
+      frame.cells[belowIdx] = { char: '-', fg, bg: BG, oid: av.uuid };
+    }
   }
 
   // 4. Flying shadow
@@ -458,6 +467,11 @@ function setFPPixel(buf: FPPixelBuffer, px: number, py: number, r: number, g: nu
   if (oid) buf.oids[idx] = oid;
 }
 
+export interface ChatBubble {
+  message: string;
+  ts: number; // timestamp when said
+}
+
 export interface FirstPersonParams {
   selfX: number;
   selfY: number;
@@ -466,6 +480,8 @@ export interface FirstPersonParams {
   waterHeight: number;
   ditherPhase?: number; // 0 = off, >0 = animated phase for spatial dither
   meshLookup?: (uuid: string) => AvatarMeshBundle | null;
+  avatarNames?: Map<string, string>; // uuid → display name
+  chatBubbles?: Map<string, ChatBubble>; // uuid → most recent chat
 }
 
 // Shared raster target for avatar mesh rendering — reused across frames
@@ -652,6 +668,8 @@ export function projectFirstPerson(
   }
 
   // Avatars: try mesh rasterization, fall back to pixel silhouettes
+  // Track screen positions for name labels
+  const avatarScreenPos: { uuid: string; cellCol: number; shoulderRow: number; dist: number }[] = [];
   const meshLookup = params.meshLookup;
   for (const av of avatars) {
     if (av.isSelf) continue;
@@ -667,6 +685,15 @@ export function projectFirstPerson(
     if (headPy >= ph || feetPy < 0) continue;
 
     const figH = Math.max(1, feetPy - headPy + 1);
+
+    // Track screen position for name label (shoulder = ~30% down from head)
+    const shoulderPy = headPy + Math.round(figH * 0.3);
+    avatarScreenPos.push({
+      uuid: av.uuid,
+      cellCol: Math.floor(screenPx / 2),
+      shoulderRow: Math.floor(shoulderPy / 2),
+      dist: forwardDist,
+    });
 
     // Try mesh rasterization
     let rendered = false;
@@ -710,6 +737,40 @@ export function projectFirstPerson(
         }
       }
       if (oid) cells[cr * cellCols + cc].oid = oid;
+    }
+  }
+
+  // Overlay name labels and chat bubbles on the cell grid
+  const avatarNames = params.avatarNames;
+  const chatBubbles = params.chatBubbles;
+  const now = Date.now();
+  for (const asp of avatarScreenPos) {
+    const name = avatarNames?.get(asp.uuid);
+    if (!name) continue;
+
+    // Build label: "Name" or "Name: message"
+    let label = name;
+    const bubble = chatBubbles?.get(asp.uuid);
+    if (bubble && now - bubble.ts < 10000) {
+      const msg = bubble.message.length > 30 ? bubble.message.slice(0, 27) + '...' : bubble.message;
+      label = `${name}: ${msg}`;
+    }
+
+    // Place label to the right of the avatar at shoulder level
+    const labelRow = Math.max(0, Math.min(cellRows - 1, asp.shoulderRow));
+    const startCol = asp.cellCol + 2; // 2 cells right of avatar center
+    if (startCol >= cellCols) continue;
+
+    // Dim color based on distance
+    const dimT = Math.min(1, asp.dist / MAX_DEPTH);
+    const lr = Math.round(255 - dimT * 100);
+    const lg = Math.round(255 - dimT * 100);
+    const lb = Math.round(200 - dimT * 100);
+    const labelFg = `#${lr.toString(16).padStart(2,'0')}${lg.toString(16).padStart(2,'0')}${lb.toString(16).padStart(2,'0')}`;
+
+    for (let i = 0; i < label.length && startCol + i < cellCols; i++) {
+      const ci = labelRow * cellCols + startCol + i;
+      cells[ci] = { char: label[i], fg: labelFg, bg: cells[ci].bg, oid: asp.uuid };
     }
   }
 

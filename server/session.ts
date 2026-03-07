@@ -3,7 +3,7 @@
 import type { WebSocket } from 'ws';
 import { SLBridge } from './sl-bridge.js';
 import {
-  type GridFrame, type ProjectionParams, type CellDelta,
+  type GridFrame, type ProjectionParams, type CellDelta, type ChatBubble,
   projectFrame, projectFirstPerson, diffFrames, createEmptyFrame,
 } from './grid-state.js';
 
@@ -20,6 +20,7 @@ export class Session {
   private statusCounter = 0;
   private muted = new Set<string>();
   private imHistory = new Map<string, { from: string; fromName: string; message: string; ts: number }[]>();
+  private chatBubbles = new Map<string, ChatBubble>(); // avatar UUID → most recent nearby chat
 
   constructor(id: string, ws: WebSocket) {
     this.id = id;
@@ -128,6 +129,10 @@ export class Session {
         onChat: (from, message, chatType, fromId) => {
           if (this.muted.has(fromId)) return;
           this.send({ type: 'chat', from, message, chatType });
+          // Track chat bubble for FP view (10s display)
+          if (fromId) {
+            this.chatBubbles.set(fromId, { message, ts: Date.now() });
+          }
         },
         onIM: (from, fromName, message, isGroup, groupName) => {
           if (this.muted.has(from)) return;
@@ -323,11 +328,28 @@ export class Session {
 
     // First-person view (main view for web client)
     const selfYaw = this.bridge.getBodyYaw();
+
+    // Build avatar name map for FP labels
+    const avatarNameMap = new Map<string, string>();
+    for (const av of avatars) {
+      if (!av.isSelf) {
+        avatarNameMap.set(av.uuid, `${av.firstName} ${av.lastName}`.trim());
+      }
+    }
+
+    // Prune expired chat bubbles (>10s old)
+    const now = Date.now();
+    for (const [uuid, bubble] of this.chatBubbles) {
+      if (now - bubble.ts > 10000) this.chatBubbles.delete(uuid);
+    }
+
     const fpFrame = projectFirstPerson(
       terrainFn, avatars, objects,
       {
         selfX: pos.x, selfY: pos.y, selfZ: pos.z, yaw: selfYaw, waterHeight,
         meshLookup: (uuid: string) => this.bridge.getAvatarMeshBundle(uuid),
+        avatarNames: avatarNameMap,
+        chatBubbles: this.chatBubbles,
       },
       this.cols, this.fpRows,
     );
