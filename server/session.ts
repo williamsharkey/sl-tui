@@ -46,9 +46,11 @@ export class Session {
         await this.handleLogin(msg);
         break;
       case 'move':
+        this.bridge.cancelFlyTo();
         this.bridge.move(msg.dir);
         break;
       case 'stop':
+        this.bridge.cancelFlyTo();
         this.bridge.stop();
         break;
       case 'fly':
@@ -94,6 +96,9 @@ export class Session {
         break;
       case 'touch':
         await this.bridge.touchObject(msg.target);
+        break;
+      case 'flyto':
+        this.bridge.flyToAvatar(msg.target);
         break;
       case 'mute':
         this.muted.add(msg.target);
@@ -310,6 +315,9 @@ export class Session {
     }
     this.prevFrame = frame;
 
+    // Autopilot tick
+    this.bridge.tickFlyTo();
+
     // Trigger periodic avatar mesh scan
     this.bridge.triggerAvatarMeshScan();
 
@@ -330,7 +338,7 @@ export class Session {
         this.send({ type: 'fpDelta', cells: fpDeltas });
       }
     } else {
-      const fpGrid = fpFrame.cells.map(c => [c.char, c.fg, '']);
+      const fpGrid = fpFrame.cells.map(c => [c.char, c.fg, c.bg || '']);
       this.send({ type: 'fpTerrain', grid: fpGrid, cols: this.cols, rows: this.fpRows });
     }
     this.prevFpFrame = fpFrame;

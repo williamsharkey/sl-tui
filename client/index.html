@@ -41,7 +41,10 @@ body { display: flex; flex-direction: column; }
   padding: 0; margin: 0; user-select: none; -webkit-user-select: none;
   width: 100%; height: 100%;
 }
-#fp-view span { display: inline; }
+#fp-view span {
+  display: inline;
+  text-shadow: -1px 0 0 #000, 1px 0 0 #000, 0 -1px 0 #000, 0 1px 0 #000;
+}
 
 /* Minimap overlay in upper-right */
 #minimap {
@@ -49,7 +52,7 @@ body { display: flex; flex-direction: column; }
   background: rgba(240, 238, 220, 0.85); border: 1px solid #999;
   font-size: 10px; line-height: 1.1; white-space: pre; letter-spacing: 0;
   padding: 2px; user-select: none; -webkit-user-select: none;
-  z-index: 5; pointer-events: none;
+  z-index: 5; pointer-events: auto; cursor: default;
 }
 #minimap span { display: inline; }
 
@@ -232,7 +235,7 @@ body { display: flex; flex-direction: column; }
       <div id="search-results"></div>
     </div>
   </div>
-  <div id="keyhints">W/S: fwd/back | A/D: strafe | &larr;&rarr;: turn | Space: jump | F: fly | PgUp/Dn: up/down | Enter: chat</div>
+  <div id="keyhints">W/S: fwd/back | A/D: strafe | &larr;&rarr;: turn | Space: jump | F: fly | PgUp/Dn: up/down | Enter: chat | Click avatar on map: fly to</div>
   <div id="chat-panel">
     <div id="chat-log"></div>
     <div id="chat-input-row">
@@ -400,6 +403,7 @@ function renderFpView(grid, c, r) {
       const cell = grid[row * fpCols + col];
       span.textContent = cell[0];
       span.style.color = cell[1];
+      if (cell[2]) span.style.backgroundColor = cell[2];
       fpSpans.push(span);
       fpViewEl.appendChild(span);
     }
@@ -414,6 +418,7 @@ function applyFpDelta(cells) {
     if (!span) continue;
     if (span.textContent !== c.char) span.textContent = c.char;
     if (span.style.color !== c.fg) span.style.color = c.fg;
+    if (c.bg && span.style.backgroundColor !== c.bg) span.style.backgroundColor = c.bg;
   }
 }
 
@@ -618,6 +623,7 @@ function showContextMenu(x, y, uuid, isAvatar, label) {
   ctxMenu.appendChild(title);
 
   const items = isAvatar ? [
+    ['Fly To', () => { send({ type: 'flyto', target: uuid }); showNotification('Flying to avatar...'); }],
     ['IM', () => openIMTab(uuid, label)],
     ['View Profile', () => send({ type: 'profile', target: uuid })],
     ['Offer Friendship', () => send({ type: 'friend', action: 'request', target: uuid })],
@@ -644,6 +650,17 @@ function showContextMenu(x, y, uuid, isAvatar, label) {
 
 document.onclick = e => {
   if (!ctxMenu.contains(e.target)) ctxMenu.style.display = 'none';
+};
+
+// Minimap left-click: fly to avatar
+minimapEl.onclick = e => {
+  const span = e.target.closest('span');
+  if (!span || !span.dataset.oid) return;
+  const ch = span.textContent;
+  const isAvatar = ['^', 'v', '<', '>', 'O', '|'].includes(ch);
+  if (!isAvatar) return;
+  send({ type: 'flyto', target: span.dataset.oid });
+  showNotification('Flying to avatar...');
 };
 
 // IM System

@@ -432,6 +432,77 @@ export class SLBridge {
     rot.w = Math.cos(this._bodyYaw / 2);
   }
 
+  // Autopilot: fly toward a target avatar
+  private _flyToTarget: string | null = null;
+  private _flyToArrivalDist = 3; // stop within 3m
+
+  flyToAvatar(uuid: string): void {
+    if (!this.bot) return;
+    this._flyToTarget = uuid;
+    // Enable flying
+    this.setFlying(true);
+  }
+
+  cancelFlyTo(): void {
+    this._flyToTarget = null;
+  }
+
+  // Called each tick — returns true while autopilot is active
+  tickFlyTo(): boolean {
+    if (!this._flyToTarget || !this.bot) return false;
+
+    const target = this.bot.currentRegion.agents.get(this._flyToTarget);
+    if (!target) {
+      // Avatar left — cancel
+      this._flyToTarget = null;
+      this.stop();
+      return false;
+    }
+
+    const myPos = this.getRawPosition();
+    if (!myPos) return false;
+
+    const tPos = target.position;
+    const dx = tPos.x - myPos.x;
+    const dy = tPos.y - myPos.y;
+    const dz = tPos.z - myPos.z;
+    const horizDist = Math.sqrt(dx * dx + dy * dy);
+    const dist3d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+
+    if (dist3d < this._flyToArrivalDist) {
+      // Arrived
+      this._flyToTarget = null;
+      this.stop();
+      return false;
+    }
+
+    // Turn to face target
+    const targetYaw = Math.atan2(dy, dx);
+    this._targetYaw = targetYaw;
+    this._bodyYaw = targetYaw;
+    this.applyBodyYaw();
+
+    // Move forward + adjust altitude
+    const agent = this.bot.agent;
+    agent.clearControlFlag(
+      ControlFlags.AGENT_CONTROL_AT_POS | ControlFlags.AGENT_CONTROL_AT_NEG |
+      ControlFlags.AGENT_CONTROL_LEFT_POS | ControlFlags.AGENT_CONTROL_LEFT_NEG |
+      ControlFlags.AGENT_CONTROL_UP_POS | ControlFlags.AGENT_CONTROL_UP_NEG
+    );
+
+    agent.setControlFlag(ControlFlags.AGENT_CONTROL_AT_POS);
+
+    // Fly up/down toward target altitude
+    if (dz > 2) {
+      agent.setControlFlag(ControlFlags.AGENT_CONTROL_UP_POS);
+    } else if (dz < -2) {
+      agent.setControlFlag(ControlFlags.AGENT_CONTROL_UP_NEG);
+    }
+
+    agent.sendAgentUpdate();
+    return true;
+  }
+
   stop(): void {
     if (!this.bot) return;
     const agent = this.bot.agent;
