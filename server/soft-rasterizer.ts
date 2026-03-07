@@ -110,9 +110,14 @@ export function rasterize(
   for (let t = 0; t + 2 < indices.length; t += 3) {
     const i0 = indices[t], i1 = indices[t + 1], i2 = indices[t + 2];
 
-    const [x0, y0, z0, w0] = transformVertex(mvp, positions[i0 * 3], positions[i0 * 3 + 1], positions[i0 * 3 + 2]);
-    const [x1, y1, z1, w1] = transformVertex(mvp, positions[i1 * 3], positions[i1 * 3 + 1], positions[i1 * 3 + 2]);
-    const [x2, y2, z2, w2] = transformVertex(mvp, positions[i2 * 3], positions[i2 * 3 + 1], positions[i2 * 3 + 2]);
+    // World-space positions for normal calculation
+    const p0x = positions[i0 * 3], p0y = positions[i0 * 3 + 1], p0z = positions[i0 * 3 + 2];
+    const p1x = positions[i1 * 3], p1y = positions[i1 * 3 + 1], p1z = positions[i1 * 3 + 2];
+    const p2x = positions[i2 * 3], p2y = positions[i2 * 3 + 1], p2z = positions[i2 * 3 + 2];
+
+    const [x0, y0, z0, w0] = transformVertex(mvp, p0x, p0y, p0z);
+    const [x1, y1, z1, w1] = transformVertex(mvp, p1x, p1y, p1z);
+    const [x2, y2, z2, w2] = transformVertex(mvp, p2x, p2y, p2z);
 
     // Clip: skip if any vertex is behind camera
     if (w0 <= 0 || w1 <= 0 || w2 <= 0) continue;
@@ -121,6 +126,19 @@ export function rasterize(
     if (x0 > 1.5 && x1 > 1.5 && x2 > 1.5) continue;
     if (y0 < -1.5 && y1 < -1.5 && y2 < -1.5) continue;
     if (y0 > 1.5 && y1 > 1.5 && y2 > 1.5) continue;
+
+    // Face normal for directional lighting
+    const e1x = p1x - p0x, e1y = p1y - p0y, e1z = p1z - p0z;
+    const e2x = p2x - p0x, e2y = p2y - p0y, e2z = p2z - p0z;
+    let nx = e1y * e2z - e1z * e2y;
+    let ny = e1z * e2x - e1x * e2z;
+    let nz = e1x * e2y - e1y * e2x;
+    const nLen = Math.sqrt(nx * nx + ny * ny + nz * nz);
+    if (nLen > 0) { nx /= nLen; ny /= nLen; nz /= nLen; }
+    // Directional light from upper-left-forward
+    const lightDot = Math.max(0, nx * -0.4 + ny * 0.3 + nz * 0.7);
+    const ambient = 0.35;
+    const faceShade = ambient + (1 - ambient) * lightDot;
 
     // Screen coordinates
     const sx0 = (x0 + 1) * hw, sy0 = (1 - y0) * hh;
@@ -142,6 +160,11 @@ export function rasterize(
     if (Math.abs(area) < 0.5) continue;
     const invArea = 1 / area;
 
+    // Pre-compute shaded color for this face
+    const sr = Math.round(baseR * faceShade);
+    const sg = Math.round(baseG * faceShade);
+    const sb = Math.round(baseB * faceShade);
+
     // Scanline rasterization with barycentric interpolation (edge function)
     for (let py = minY; py <= maxY; py++) {
       for (let px = minX; px <= maxX; px++) {
@@ -159,12 +182,10 @@ export function rasterize(
 
         if (pz < depth[idx]) {
           depth[idx] = pz;
-          // Depth-based shade: darken near objects, lighten far
-          const shade = 0.4 + 0.6 * Math.max(0, Math.min(1, (pz + 1) / 2));
           const ci = idx * 4;
-          color[ci]     = Math.round(baseR * shade);
-          color[ci + 1] = Math.round(baseG * shade);
-          color[ci + 2] = Math.round(baseB * shade);
+          color[ci]     = sr;
+          color[ci + 1] = sg;
+          color[ci + 2] = sb;
           color[ci + 3] = 255;
         }
       }

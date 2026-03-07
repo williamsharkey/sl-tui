@@ -3,3 +3,8 @@ dist/
 *.js.map
 .DS_Store
 .claude/
+
+# C build artifacts
+sl-tui
+src/**/*.o
+src/cjson/*.o

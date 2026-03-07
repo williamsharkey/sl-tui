@@ -41,7 +41,7 @@ export function renderLoginScreen(out: WritableTarget, state: LoginState): void 
 
   // Title
   buf += moveTo(startRow, startCol) + BOLD + '  SL-TUI: Second Life Terminal Client' + RESET;
-  buf += moveTo(startRow + 1, startCol) + DIM + '  \u2500'.repeat(boxW - 4) + RESET;
+  buf += moveTo(startRow + 1, startCol) + ' ';
 
   // Fields
   const fields: { label: string; key: LoginField; mask: boolean }[] = [
@@ -74,6 +74,17 @@ export function renderLoginScreen(out: WritableTarget, state: LoginState): void 
   }
   buf += moveTo(startRow + 12, startCol + 2) + DIM + 'Tab: next field  Enter: login  Ctrl+C: quit' + RESET;
 
+  out.write(buf);
+}
+
+export function renderLoadingScreen(out: WritableTarget, message = 'Connecting to Second Life...'): void {
+  const w = out.columns;
+  const h = out.rows;
+  const startCol = Math.max(0, Math.floor((w - message.length - 4) / 2));
+  const startRow = Math.max(0, Math.floor(h / 2));
+  let buf = `${ESC}2J`; // clear
+  buf += moveTo(startRow, startCol) + BOLD + '  ' + message + RESET;
+  buf += moveTo(startRow + 1, startCol) + DIM + '  Please wait...' + RESET;
   out.write(buf);
 }
 

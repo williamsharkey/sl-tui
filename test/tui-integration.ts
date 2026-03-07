@@ -112,7 +112,7 @@ class MockSLBridge implements ISLBridge {
     const p = this.pos || { x: 128, y: 128, z: 25 };
     return [
       { uuid: 'self-uuid-1234', firstName: 'Test', lastName: 'User', x: p.x, y: p.y, z: p.z, yaw: 0, isSelf: true },
-      { uuid: 'other-uuid-5678', firstName: 'Other', lastName: 'Avatar', x: 140, y: 140, z: 25, yaw: 1.57, isSelf: false },
+      { uuid: 'other-uuid-5678', firstName: 'Other', lastName: 'Avatar', x: 180, y: 180, z: 25, yaw: 1.57, isSelf: false },
     ];
   }
 
@@ -159,6 +159,15 @@ class MockSLBridge implements ISLBridge {
   inspectObject(uuid: string) { return { name: 'Test Object', description: 'desc', owner: 'owner-uuid', position: '128, 128, 25' }; }
   inspectAvatar(uuid: string) { return { name: 'Other Avatar', title: 'Tester', position: '140, 140, 25' }; }
   async getFriendsList() { return [{ uuid: 'friend-1', name: 'Friend One', online: true, rightsGiven: false, rightsHas: false }]; }
+
+  flyToAvatar(uuid: string) {}
+  cancelFlyTo() {}
+  tickFlyTo() { return false; }
+  onRegionChange(cb: () => void) {}
+  checkRegionCrossing() {}
+  triggerAvatarMeshScan() {}
+  getAvatarMeshBundle(uuid: string) { return null; }
+  getSkyColors() { return null; }
 
   startTick(callback: () => void, hz = 4) {
     this.tickCallback = callback;

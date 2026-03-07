@@ -3,7 +3,7 @@
 import * as readline from 'readline';
 import type { ISLBridge } from './types.js';
 
-export type Mode = 'login' | 'grid' | 'chat-input';
+export type Mode = 'login' | 'grid' | 'chat-input' | 'menu';
 
 export interface InputCallbacks {
   onMove: (dir: string) => void;
@@ -18,6 +18,8 @@ export interface InputCallbacks {
   onChatChar: (char: string) => void;
   onChatBackspace: () => void;
   onQuit: () => void;
+  onOpenMenu: () => void;
+  onMenuKey: (str: string | undefined, key: readline.Key) => void;
   onLoginChar: (char: string) => void;
   onLoginBackspace: () => void;
   onLoginSubmit: () => void;
@@ -74,6 +76,8 @@ export class InputHandler {
       this.handleGridKey(str, key);
     } else if (this.mode === 'chat-input') {
       this.handleChatKey(str, key);
+    } else if (this.mode === 'menu') {
+      this.callbacks.onMenuKey(str, key);
     }
   }
 
@@ -132,6 +136,8 @@ export class InputHandler {
       this.callbacks.onToggleDither();
     } else if (key.name === 'return') {
       this.callbacks.onEnterChat();
+    } else if (str === '/' || key.name === 'tab') {
+      this.callbacks.onOpenMenu();
     } else if (str === 'q' || str === 'Q') {
       this.callbacks.onQuit();
     }

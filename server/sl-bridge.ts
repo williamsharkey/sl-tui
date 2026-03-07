@@ -44,6 +44,8 @@ export class SLBridge {
   private _objectCache: ObjectData[] = [];
   private _objectCacheAge = 0;
   private _terrainCache = new Map<number, number>(); // (y*256+x) → height
+  private _lastRegionName: string = '';
+  private _onRegionChange: (() => void) | null = null;
 
   // Position interpolation state
   private _serverPos: { x: number; y: number; z: number } | null = null;
@@ -51,6 +53,7 @@ export class SLBridge {
   private _velocity: { x: number; y: number; z: number } = { x: 0, y: 0, z: 0 };
   private _lastServerUpdate = 0;
   private _lastPosTime = 0;
+  private _activeMove: string | null = null; // current movement direction for dead reckoning
 
   async login(firstName: string, lastName: string, password: string, callbacks: BridgeCallbacks): Promise<{ region: string; waterHeight: number }> {
     const params = new LoginParameters();
@@ -90,6 +93,7 @@ export class SLBridge {
 
     // Cache self ID (avoid toString() every tick)
     this._selfId = this.bot.agent.agentID.toString();
+    this._lastRegionName = region.regionName;
 
     // Attach avatar mesh cache
     this.avatarCache.attach(this.bot);
@@ -103,6 +107,8 @@ export class SLBridge {
 
     this.subscriptions.push(
       this.bot.clientEvents.onInstantMessage.subscribe((e: InstantMessageEvent) => {
+        // Skip typing indicators and other empty messages
+        if (!e.message || e.message.trim() === '') return;
         callbacks.onIM(e.from?.toString() ?? '', e.fromName, e.message, false);
       })
     );
@@ -183,42 +189,60 @@ export class SLBridge {
 
     if (moved) {
       const dt = (now - this._lastServerUpdate) / 1000;
-      if (dt > 0.01) {
-        this._velocity = { x: dx / dt, y: dy / dt, z: dz / dt };
+      if (dt > 0.05) {
+        // Smooth velocity with exponential moving average to avoid spikes
+        const newVx = dx / dt, newVy = dy / dt, newVz = dz / dt;
+        const blend = 0.4; // blend new velocity (lower = smoother)
+        this._velocity.x = this._velocity.x * (1 - blend) + newVx * blend;
+        this._velocity.y = this._velocity.y * (1 - blend) + newVy * blend;
+        this._velocity.z = this._velocity.z * (1 - blend) + newVz * blend;
       }
       this._serverPos = { ...raw };
       this._lastServerUpdate = now;
     }
 
-    // Interpolate: blend display position toward server position
     if (this._displayPos) {
       const dt = (now - this._lastPosTime) / 1000;
-      const LERP_SPEED = 8; // Higher = snappier correction
-      const t = Math.min(1, LERP_SPEED * dt);
+      const timeSinceUpdate = (now - this._lastServerUpdate) / 1000;
 
-      // Predict where server pos will be based on velocity
-      const predDt = Math.min(0.25, (now - this._lastServerUpdate) / 1000);
-      const predX = this._serverPos.x + this._velocity.x * predDt;
-      const predY = this._serverPos.y + this._velocity.y * predDt;
-      const predZ = this._serverPos.z + this._velocity.z * predDt;
+      // Client-side dead reckoning from active movement input
+      // SL walk speed ~3.2 m/s, fly speed ~16 m/s, run ~5 m/s
+      if (this._activeMove && dt > 0) {
+        const moveSpeed = this._flying ? 16 : 3.2;
+        const yaw = this._bodyYaw;
+        let mx = 0, my = 0, mz = 0;
+        switch (this._activeMove) {
+          case 'forward':  mx = Math.cos(yaw) * moveSpeed; my = Math.sin(yaw) * moveSpeed; break;
+          case 'back':     mx = -Math.cos(yaw) * moveSpeed; my = -Math.sin(yaw) * moveSpeed; break;
+          case 'strafe_left':  mx = Math.sin(yaw) * moveSpeed; my = -Math.cos(yaw) * moveSpeed; break;
+          case 'strafe_right': mx = -Math.sin(yaw) * moveSpeed; my = Math.cos(yaw) * moveSpeed; break;
+          case 'up':       mz = moveSpeed; break;
+          case 'down':     mz = -moveSpeed; break;
+        }
+        // Apply directly to display position (immediate response)
+        this._displayPos.x += mx * dt;
+        this._displayPos.y += my * dt;
+        this._displayPos.z += mz * dt;
+      }
 
-      // Lerp toward predicted position
-      this._displayPos.x += (predX - this._displayPos.x) * t;
-      this._displayPos.y += (predY - this._displayPos.y) * t;
-      this._displayPos.z += (predZ - this._displayPos.z) * t;
+      // Also lerp toward server position to correct drift
+      const correctionSpeed = this._activeMove ? 2 : 5; // slower correction while moving
+      const t = 1 - Math.exp(-correctionSpeed * dt);
+      this._displayPos.x += (this._serverPos.x - this._displayPos.x) * t;
+      this._displayPos.y += (this._serverPos.y - this._displayPos.y) * t;
+      this._displayPos.z += (this._serverPos.z - this._displayPos.z) * t;
 
-      // Snap if very close
-      const snapDist = Math.abs(predX - this._displayPos.x) + Math.abs(predY - this._displayPos.y);
-      if (snapDist < 0.05) {
+      // Hard snap for teleports (large jumps > 15m)
+      const jumpDist = Math.sqrt(
+        (this._serverPos.x - this._displayPos.x) ** 2 +
+        (this._serverPos.y - this._displayPos.y) ** 2 +
+        (this._serverPos.z - this._displayPos.z) ** 2
+      );
+      if (jumpDist > 15) {
         this._displayPos.x = this._serverPos.x;
         this._displayPos.y = this._serverPos.y;
         this._displayPos.z = this._serverPos.z;
-        // Decay velocity when stationary
-        if (!moved) {
-          this._velocity.x *= 0.8;
-          this._velocity.y *= 0.8;
-          this._velocity.z *= 0.8;
-        }
+        this._velocity = { x: 0, y: 0, z: 0 };
       }
     }
 
@@ -264,6 +288,78 @@ export class SLBridge {
   getRegionName(): string {
     if (!this.bot) return '';
     return this.bot.currentRegion.regionName;
+  }
+
+  getSkyColors(): { zenith: [number, number, number]; horizon: [number, number, number]; sunDir: [number, number, number] } | null {
+    if (!this.bot) return null;
+    try {
+      const env = this.bot.currentRegion.environment;
+      if (!env?.dayCycle) return null;
+      const sky = env.dayCycle;
+
+      // Extract sky colors from EEP/WindLight settings
+      // legacyHaze.blueHorizon = horizon color, blueDensity = zenith blue
+      // sunlightColor = sun tint, sunRotation = sun direction
+      const haze = sky.legacyHaze;
+      let zenith: [number, number, number] = [0x1a, 0x1a, 0x2e]; // default dark
+      let horizon: [number, number, number] = [0x55, 0x55, 0x66];
+
+      if (haze?.blueDensity) {
+        // EEP values are typically 0-1 floats representing HDR color
+        const bd = haze.blueDensity;
+        zenith = [
+          Math.min(255, Math.round((bd.x ?? 0) * 255 * 2)),
+          Math.min(255, Math.round((bd.y ?? 0) * 255 * 2)),
+          Math.min(255, Math.round((bd.z ?? 0) * 255 * 2)),
+        ];
+      }
+      if (haze?.blueHorizon) {
+        const bh = haze.blueHorizon;
+        horizon = [
+          Math.min(255, Math.round((bh.x ?? 0) * 255 * 2)),
+          Math.min(255, Math.round((bh.y ?? 0) * 255 * 2)),
+          Math.min(255, Math.round((bh.z ?? 0) * 255 * 2)),
+        ];
+      }
+
+      // Sun direction from rotation quaternion
+      let sunDir: [number, number, number] = [0.3, 0.8, 0.5];
+      if (sky.sunRotation) {
+        const q = sky.sunRotation;
+        // Forward vector (0,0,-1) rotated by quaternion
+        const qx = q.x ?? 0, qy = q.y ?? 0, qz = q.z ?? 0, qw = q.w ?? 1;
+        sunDir = [
+          2 * (qx * qz + qw * qy),
+          2 * (qy * qz - qw * qx),
+          -(1 - 2 * (qx * qx + qy * qy)),
+        ];
+      }
+
+      return { zenith, horizon, sunDir };
+    } catch {
+      return null;
+    }
+  }
+
+  // Set callback for region changes (called when we detect a new region)
+  onRegionChange(cb: () => void): void {
+    this._onRegionChange = cb;
+  }
+
+  // Check if region has changed and invalidate caches if so
+  checkRegionCrossing(): void {
+    if (!this.bot) return;
+    const currentName = this.bot.currentRegion.regionName;
+    if (this._lastRegionName && currentName !== this._lastRegionName) {
+      // Region changed — invalidate all caches
+      this._terrainCache.clear();
+      this._objectCache = [];
+      this._objectCacheAge = 0;
+      this._serverPos = null;
+      this._displayPos = null;
+      this._onRegionChange?.();
+    }
+    this._lastRegionName = currentName;
   }
 
   getAvatars(): AvatarData[] {
@@ -340,12 +436,17 @@ export class SLBridge {
     // Snap to target yaw immediately when moving so direction is correct
     this._bodyYaw = this._targetYaw;
 
+    // Only send update if direction changed (avoid spamming clear/set on key repeat)
+    if (dir === this._activeMove) return;
+
     // Clear previous movement
     agent.clearControlFlag(
       ControlFlags.AGENT_CONTROL_AT_POS | ControlFlags.AGENT_CONTROL_AT_NEG |
       ControlFlags.AGENT_CONTROL_LEFT_POS | ControlFlags.AGENT_CONTROL_LEFT_NEG |
       ControlFlags.AGENT_CONTROL_UP_POS | ControlFlags.AGENT_CONTROL_UP_NEG
     );
+
+    this._activeMove = dir;
 
     switch (dir) {
       case 'forward':
@@ -377,7 +478,7 @@ export class SLBridge {
 
   // Turn left/right by a fixed increment — sets target, animation is in getBodyYaw()
   turn(direction: 'left' | 'right'): void {
-    const TURN_STEP = Math.PI / 8; // 22.5 degrees per press
+    const TURN_STEP = Math.PI / 16; // 11.25 degrees per press
     if (direction === 'left') {
       this._targetYaw += TURN_STEP;
     } else {
@@ -518,6 +619,7 @@ export class SLBridge {
 
   stop(): void {
     if (!this.bot) return;
+    this._activeMove = null;
     const agent = this.bot.agent;
     agent.clearControlFlag(
       ControlFlags.AGENT_CONTROL_AT_POS | ControlFlags.AGENT_CONTROL_AT_NEG |

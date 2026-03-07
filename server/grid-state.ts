@@ -160,7 +160,7 @@ function renderFovArc(
         const existing = frame.cells[idx].char;
         if (existing !== '@' && existing !== '^' && existing !== 'v' &&
             existing !== '<' && existing !== '>' && existing !== '#' &&
-            existing !== 'T') {
+            existing !== 'T' && existing !== '+' && existing !== '-') {
           frame.cells[idx] = { char: '·', fg: FOV_COLOR, bg: BG };
         }
       }
@@ -241,6 +241,32 @@ export function projectFrame(
         frame.cells[row * cols + col] = terrainCell(h, waterHeight);
       } else {
         frame.cells[row * cols + col] = { char: ' ', fg: '#333333', bg: BG };
+      }
+    }
+  }
+
+  // 1b. Sim border overlay — draw border chars where adjacent cell crosses 0 or 256
+  const BORDER_COLOR = '#cc6600';
+  for (let row = 0; row < rows; row++) {
+    for (let col = 0; col < cols; col++) {
+      const sx = (col - cols / 2) * metersPerCell;
+      const sy = (rows / 2 - row) * metersPerCell;
+      const simX = selfX + sx * sinY + sy * cosY;
+      const simY = selfY - sx * cosY + sy * sinY;
+      // Check if this cell is near a sim boundary (within 1 cell width)
+      const nearBorderX = simX < metersPerCell || simX > 256 - metersPerCell;
+      const nearBorderY = simY < metersPerCell || simY > 256 - metersPerCell;
+      if (nearBorderX || nearBorderY) {
+        // Only draw on the in-bounds side
+        if (simX >= 0 && simX < 256 && simY >= 0 && simY < 256) {
+          const idx = row * cols + col;
+          const existing = frame.cells[idx];
+          // Don't overwrite avatars/objects/self
+          if (existing.char !== '@' && existing.char !== '#' && existing.char !== 'T' &&
+              !'^v<>'.includes(existing.char)) {
+            frame.cells[idx] = { char: '│', fg: BORDER_COLOR, bg: BG };
+          }
+        }
       }
     }
   }
@@ -388,14 +414,46 @@ const SKY_RGB: [number, number, number] = [0x1a, 0x1a, 0x2e];
 const HORIZON_RGB: [number, number, number] = [0x55, 0x55, 0x66];
 const FOG_RGB: [number, number, number] = [0x66, 0x77, 0x88];
 
-// Terrain type → RGB base color
+// Terrain color stops for smooth gradient interpolation
+// Each stop: [height_offset_from_water, R, G, B]
+const TERRAIN_STOPS: [number, number, number, number][] = [
+  [-10, 0x10, 0x44, 0x88], // abyss
+  [-5,  0x18, 0x55, 0x99], // deep ocean
+  [-2,  0x22, 0x66, 0xaa], // deep water
+  [0,   0x44, 0x88, 0xbb], // water surface
+  [0.3, 0xaa, 0x99, 0x77], // wet sand
+  [1.5, 0x99, 0x88, 0x66], // beach
+  [3,   0x66, 0x88, 0x44], // scrub
+  [8,   0x33, 0x77, 0x33], // lush grass
+  [15,  0x44, 0x66, 0x33], // grass
+  [25,  0x55, 0x66, 0x33], // dry grass
+  [35,  0x66, 0x66, 0x44], // foothills
+  [50,  0x77, 0x77, 0x55], // hills
+  [70,  0x88, 0x88, 0x77], // rocky
+  [90,  0x77, 0x77, 0x77], // mountain
+  [120, 0xaa, 0xaa, 0xaa], // snow
+];
+
+// Smooth lerp between terrain color stops — every unique height gets a unique color
 function terrainRGB(height: number, waterHeight: number): [number, number, number] {
-  if (height < waterHeight - 2) return [0x22, 0x66, 0xaa]; // deep water
-  if (height < waterHeight)     return [0x44, 0x88, 0xbb]; // water
-  if (height < waterHeight + 1) return [0x99, 0x88, 0x66]; // beach
-  if (height < waterHeight + 15) return [0x33, 0x66, 0x33]; // ground
-  if (height < waterHeight + 40) return [0x66, 0x66, 0x33]; // hills
-  return [0x66, 0x66, 0x66]; // mountains
+  const h = height - waterHeight;
+  // Clamp to range
+  if (h <= TERRAIN_STOPS[0][0]) return [TERRAIN_STOPS[0][1], TERRAIN_STOPS[0][2], TERRAIN_STOPS[0][3]];
+  const last = TERRAIN_STOPS[TERRAIN_STOPS.length - 1];
+  if (h >= last[0]) return [last[1], last[2], last[3]];
+  // Find the two bracketing stops and lerp
+  for (let i = 0; i < TERRAIN_STOPS.length - 1; i++) {
+    const a = TERRAIN_STOPS[i], b = TERRAIN_STOPS[i + 1];
+    if (h >= a[0] && h < b[0]) {
+      const t = (h - a[0]) / (b[0] - a[0]);
+      return [
+        Math.round(a[1] + (b[1] - a[1]) * t),
+        Math.round(a[2] + (b[2] - a[2]) * t),
+        Math.round(a[3] + (b[3] - a[3]) * t),
+      ];
+    }
+  }
+  return [last[1], last[2], last[3]];
 }
 
 // Water surface pixel: add wavelet pattern
@@ -412,18 +470,20 @@ function waterPixelRGB(height: number, waterHeight: number, wx: number, wy: numb
 }
 
 // Apply depth fog to RGB
-function fogRGB(r: number, g: number, b: number, depth: number, maxDepth: number): [number, number, number] {
+function fogRGB(r: number, g: number, b: number, depth: number, maxDepth: number, fog?: [number, number, number]): [number, number, number] {
   const t = Math.min(1, depth / maxDepth);
+  const f = fog ?? FOG_RGB;
   return [
-    Math.round(r + (FOG_RGB[0] - r) * t),
-    Math.round(g + (FOG_RGB[1] - g) * t),
-    Math.round(b + (FOG_RGB[2] - b) * t),
+    Math.round(r + (f[0] - r) * t),
+    Math.round(g + (f[1] - g) * t),
+    Math.round(b + (f[2] - b) * t),
   ];
 }
 
-// Pixel buffer + OID buffer for FP rendering
+// Pixel buffer + depth buffer + OID buffer for FP rendering
 interface FPPixelBuffer {
   pixels: Uint8Array;   // RGBA, (pw * ph * 4)
+  depth: Float32Array;  // per-pixel depth for occlusion
   oids: (string | undefined)[];  // per-pixel object/avatar UUID
   pw: number;
   ph: number;
@@ -436,6 +496,7 @@ function getFPPixelBuffer(pw: number, ph: number): FPPixelBuffer {
   if (!fpPixBuf || fpPixBuf.pw !== pw || fpPixBuf.ph !== ph) {
     fpPixBuf = {
       pixels: new Uint8Array(pw * ph * 4),
+      depth: new Float32Array(pw * ph),
       oids: new Array(pw * ph),
       pw, ph,
     };
@@ -443,28 +504,46 @@ function getFPPixelBuffer(pw: number, ph: number): FPPixelBuffer {
   return fpPixBuf;
 }
 
-function clearFPPixelBuffer(buf: FPPixelBuffer): void {
-  // Fill with sky color
-  for (let i = 0; i < buf.pw * buf.ph; i++) {
-    const ci = i * 4;
-    buf.pixels[ci]     = SKY_RGB[0];
-    buf.pixels[ci + 1] = SKY_RGB[1];
-    buf.pixels[ci + 2] = SKY_RGB[2];
-    buf.pixels[ci + 3] = 255;
-    buf.oids[i] = undefined;
+function clearFPPixelBuffer(
+  buf: FPPixelBuffer,
+  zenith?: [number, number, number],
+  horizon?: [number, number, number],
+): void {
+  buf.depth.fill(Infinity);
+  const z = zenith ?? SKY_RGB;
+  const h = horizon ?? HORIZON_RGB;
+  const halfH = buf.ph / 2;
+  for (let py = 0; py < buf.ph; py++) {
+    // Gradient: zenith at top → horizon at middle → slightly below for lower sky
+    const t = Math.min(1, py / halfH); // 0 at top, 1 at horizon
+    const sr = Math.round(z[0] + (h[0] - z[0]) * t);
+    const sg = Math.round(z[1] + (h[1] - z[1]) * t);
+    const sb = Math.round(z[2] + (h[2] - z[2]) * t);
+    for (let px = 0; px < buf.pw; px++) {
+      const idx = py * buf.pw + px;
+      const ci = idx * 4;
+      buf.pixels[ci]     = sr;
+      buf.pixels[ci + 1] = sg;
+      buf.pixels[ci + 2] = sb;
+      buf.pixels[ci + 3] = 255;
+      buf.oids[idx] = undefined;
+    }
   }
 }
 
-// Set a pixel in the FP buffer
-function setFPPixel(buf: FPPixelBuffer, px: number, py: number, r: number, g: number, b: number, oid?: string): void {
+// Set a pixel in the FP buffer with optional depth test
+function setFPPixel(buf: FPPixelBuffer, px: number, py: number, r: number, g: number, b: number, oid?: string, pixDepth?: number): void {
   if (px < 0 || px >= buf.pw || py < 0 || py >= buf.ph) return;
   const idx = py * buf.pw + px;
+  // Depth test: reject if farther than existing pixel
+  if (pixDepth !== undefined && pixDepth >= buf.depth[idx]) return;
   const ci = idx * 4;
   buf.pixels[ci]     = r;
   buf.pixels[ci + 1] = g;
   buf.pixels[ci + 2] = b;
   buf.pixels[ci + 3] = 255;
   if (oid) buf.oids[idx] = oid;
+  if (pixDepth !== undefined) buf.depth[idx] = pixDepth;
 }
 
 export interface ChatBubble {
@@ -482,12 +561,13 @@ export interface FirstPersonParams {
   meshLookup?: (uuid: string) => AvatarMeshBundle | null;
   avatarNames?: Map<string, string>; // uuid → display name
   chatBubbles?: Map<string, ChatBubble>; // uuid → most recent chat
+  skyColors?: { zenith: [number, number, number]; horizon: [number, number, number] };
 }
 
 // Shared raster target for avatar mesh rendering — reused across frames
 let meshRasterTarget: ReturnType<typeof createRasterTarget> | null = null;
-const MESH_PIXEL_W = 32;  // pixels per avatar render (doubled via quadrant)
-const MESH_PIXEL_H = 64;
+const MESH_PIXEL_W = 64;  // pixels per avatar render
+const MESH_PIXEL_H = 128;
 
 function getMeshRasterTarget() {
   if (!meshRasterTarget || meshRasterTarget.width !== MESH_PIXEL_W || meshRasterTarget.height !== MESH_PIXEL_H) {
@@ -496,16 +576,16 @@ function getMeshRasterTarget() {
   return meshRasterTarget;
 }
 
-// Cheap spatial hash noise for dither — blobby, flowing, spatially coherent
+// Spatial noise for dither — high-frequency, low-amplitude textural drift
 function ditherNoise(x: number, y: number, phase: number): [number, number] {
-  // Two octaves of sin-based spatial noise, phase-shifted for flow
-  const s1 = Math.sin(x * 0.7 + phase * 1.3) * Math.cos(y * 0.9 + phase * 0.7);
-  const s2 = Math.sin(y * 0.6 - phase * 1.1) * Math.cos(x * 0.8 - phase * 0.9);
-  const s3 = Math.sin((x + y) * 0.4 + phase * 2.1) * 0.5;
-  const s4 = Math.cos((x - y) * 0.5 + phase * 1.7) * 0.5;
+  // Four octaves of high-frequency sin-based noise, small displacement
+  const s1 = Math.sin(x * 2.8 + phase * 1.3) * Math.cos(y * 3.6 + phase * 0.7);
+  const s2 = Math.sin(y * 2.4 - phase * 1.1) * Math.cos(x * 3.2 - phase * 0.9);
+  const s3 = Math.sin((x + y) * 1.6 + phase * 2.1) * 0.5;
+  const s4 = Math.cos((x - y) * 2.0 + phase * 1.7) * 0.5;
   return [
-    (s1 + s3) * 1.2, // dx offset in meters
-    (s2 + s4) * 1.2, // dy offset in meters
+    (s1 + s3) * 0.6, // dx offset in meters (half amplitude)
+    (s2 + s4) * 0.6, // dy offset in meters
   ];
 }
 
@@ -517,14 +597,20 @@ export function projectFirstPerson(
   cols: number,
   rows: number,
 ): GridFrame {
-  const { selfX, selfY, selfZ, yaw, waterHeight, ditherPhase } = params;
+  const { selfX, selfY, selfZ, yaw, waterHeight, ditherPhase, skyColors } = params;
   const dither = ditherPhase !== undefined && ditherPhase > 0;
 
-  // Pixel buffer at 2x resolution
+  // Sky colors from region environment, or defaults
+  const skyZenith: [number, number, number] = skyColors?.zenith ?? SKY_RGB;
+  const skyHorizon: [number, number, number] = skyColors?.horizon ?? HORIZON_RGB;
+  // Fog color matches the horizon for natural fade
+  const fogColor: [number, number, number] = skyHorizon;
+
+  // Pixel buffer at 2x3 resolution (sextant characters: 2 wide x 3 tall per cell)
   const pw = cols * 2;
-  const ph = rows * 2;
+  const ph = rows * 3;
   const buf = getFPPixelBuffer(pw, ph);
-  clearFPPixelBuffer(buf);
+  clearFPPixelBuffer(buf, skyZenith, skyHorizon);
 
   // ─── Comanche-style voxel space raycasting ───────────────────────
   // Each pixel column casts a ray from the camera through the view
@@ -561,53 +647,104 @@ export function projectFirstPerson(
     // Cosine correction to prevent fisheye distortion
     const cosCorrection = Math.cos(rayAngle - yaw);
 
-    // March along the ray front-to-back with adaptive step size
+    // March along the ray front-to-back
+    // Track previous sample's projected screen Y to interpolate spans smoothly
     let depth = NEAR;
-    let stepSize = 0.5;
+    let prevScreenPy = ph; // off-screen bottom
+    let prevH = 0;
+    let prevDepth = NEAR;
+    let prevInBounds = false;
 
     while (depth < MAX_DEPTH && topDrawn[pcol] > 0) {
       const wx = selfX + rayDirX * depth;
       const wy = selfY + rayDirY * depth;
 
-      // Apply dither noise at distance
+      // Apply dither noise — strong nearby (windy grass), fades to near-zero at distance
       let sampleX = wx, sampleY = wy;
       if (dither) {
-        const scale = Math.min(1, depth / 20);
-        const [ddx, ddy] = ditherNoise(wx * 0.15, wy * 0.15, ditherPhase!);
-        sampleX += ddx * scale;
-        sampleY += ddy * scale;
+        const scale = Math.max(0, 1 - depth / 30);
+        if (scale > 0.01) {
+          const [ddx, ddy] = ditherNoise(wx * 0.6, wy * 0.6, ditherPhase!);
+          sampleX += ddx * scale;
+          sampleY += ddy * scale;
+        }
       }
 
       if (sampleX >= 0 && sampleX < 256 && sampleY >= 0 && sampleY < 256) {
-        const h = terrain(Math.floor(sampleX), Math.floor(sampleY));
+        // Bilinear interpolation for smooth terrain
+        const ix = Math.floor(sampleX), iy = Math.floor(sampleY);
+        const fx = sampleX - ix, fy = sampleY - iy;
+        const ix1 = Math.min(ix + 1, 255), iy1 = Math.min(iy + 1, 255);
+        const h00 = terrain(ix, iy), h10 = terrain(ix1, iy);
+        const h01 = terrain(ix, iy1), h11 = terrain(ix1, iy1);
+        const h = h00 * (1 - fx) * (1 - fy) + h10 * fx * (1 - fy)
+                + h01 * (1 - fx) * fy + h11 * fx * fy;
 
         // Perspective project: screen Y from height difference and corrected depth
         const correctedDepth = depth * cosCorrection;
         const heightOnScreen = ((CAMERA_HEIGHT - h) / correctedDepth) * ph;
         const screenPy = Math.round(HORIZON + heightOnScreen);
 
-        if (screenPy < topDrawn[pcol]) {
-          const drawFrom = Math.max(0, screenPy);
+        // Connect to previous sample: interpolate between prevScreenPy and screenPy
+        // This fills the vertical gap between consecutive samples smoothly
+        // instead of leaving spiky gaps
+        let drawTop = screenPy;
+        if (prevInBounds && prevScreenPy < topDrawn[pcol] && drawTop > prevScreenPy) {
+          // Previous sample projected higher on screen — fill the gap between them
+          // by extending the current sample's span up to meet the previous one
+          drawTop = prevScreenPy;
+        }
+
+        if (drawTop < topDrawn[pcol]) {
+          const drawFrom = Math.max(0, drawTop);
           const drawTo = topDrawn[pcol];
 
           let [tr, tg, tb] = (h < waterHeight)
             ? waterPixelRGB(h, waterHeight, sampleX, sampleY, depth)
             : terrainRGB(h, waterHeight);
-          [tr, tg, tb] = fogRGB(tr, tg, tb, depth, MAX_DEPTH);
 
+          // Slope-based shading: compute terrain gradient for directional light
+          if (h >= waterHeight) {
+            const gx = h10 - h00;
+            const gy = h01 - h00;
+            const shade = 0.85 + 0.15 * Math.max(-1, Math.min(1, (-gx + gy) * 0.3));
+            tr = Math.round(tr * shade);
+            tg = Math.round(tg * shade);
+            tb = Math.round(tb * shade);
+          }
+
+          [tr, tg, tb] = fogRGB(tr, tg, tb, depth, MAX_DEPTH, fogColor);
+
+          // Vertical gradient within span for sextant detail
+          const spanLen = drawTo - drawFrom;
           for (let py = drawFrom; py < drawTo; py++) {
-            setFPPixel(buf, pcol, py, tr, tg, tb);
+            if (spanLen > 1) {
+              const vt = (py - drawFrom) / (spanLen - 1);
+              const vShade = 1.08 - 0.16 * vt;
+              setFPPixel(buf, pcol, py,
+                Math.min(255, Math.round(tr * vShade)),
+                Math.min(255, Math.round(tg * vShade)),
+                Math.min(255, Math.round(tb * vShade)),
+                undefined, correctedDepth);
+            } else {
+              setFPPixel(buf, pcol, py, tr, tg, tb, undefined, correctedDepth);
+            }
           }
 
           topDrawn[pcol] = drawFrom;
         }
+
+        prevScreenPy = screenPy;
+        prevH = h;
+        prevDepth = depth;
+        prevInBounds = true;
+      } else {
+        prevInBounds = false;
       }
 
-      // Adaptive step: smaller steps close, larger far away
-      depth += stepSize;
-      if (depth > 8) stepSize = 1;
-      if (depth > 30) stepSize = 2;
-      if (depth > 60) stepSize = 3;
+      // Adaptive step: finer steps close, coarser far away
+      // Step size proportional to depth ensures ~constant screen-space sampling
+      depth += Math.max(0.4, depth * 0.04);
     }
   }
 
@@ -616,7 +753,7 @@ export function projectFirstPerson(
   if (horizonPy >= 0 && horizonPy < ph) {
     for (let pcol = 0; pcol < pw; pcol++) {
       if (topDrawn[pcol] > horizonPy) {
-        setFPPixel(buf, pcol, horizonPy, HORIZON_RGB[0], HORIZON_RGB[1], HORIZON_RGB[2]);
+        setFPPixel(buf, pcol, horizonPy, skyHorizon[0], skyHorizon[1], skyHorizon[2]);
       }
     }
   }
@@ -648,10 +785,9 @@ export function projectFirstPerson(
     if (!proj) continue;
     const { px: screenPx, py: screenPy, dist: forwardDist } = proj;
     if (screenPy < 0 || screenPy >= ph) continue;
-    if (screenPy >= topDrawn[Math.max(0, Math.min(pw - 1, screenPx))]) continue;
 
     const baseRGB: [number, number, number] = obj.isTree ? [0x33, 0x66, 0x33] : [0x88, 0x55, 0x22];
-    const [or, og, ob] = fogRGB(baseRGB[0], baseRGB[1], baseRGB[2], forwardDist, MAX_DEPTH);
+    const [or, og, ob] = fogRGB(baseRGB[0], baseRGB[1], baseRGB[2], forwardDist, MAX_DEPTH, fogColor);
 
     const entityPxH = Math.max(2, Math.round((obj.scaleZ || 2) / forwardDist * ph));
     const entityPxW = Math.max(2, Math.round((Math.max(obj.scaleX, obj.scaleY) || 1) / forwardDist * ph));
@@ -660,9 +796,7 @@ export function projectFirstPerson(
 
     for (let py = startPy; py <= screenPy && py < ph; py++) {
       for (let px = startPx; px < startPx + entityPxW && px < pw; px++) {
-        if (px < 0 || px >= pw) continue;
-        if (py >= topDrawn[px]) continue;
-        setFPPixel(buf, px, py, or, og, ob, obj.uuid);
+        setFPPixel(buf, px, py, or, og, ob, obj.uuid, forwardDist);
       }
     }
   }
@@ -691,7 +825,7 @@ export function projectFirstPerson(
     avatarScreenPos.push({
       uuid: av.uuid,
       cellCol: Math.floor(screenPx / 2),
-      shoulderRow: Math.floor(shoulderPy / 2),
+      shoulderRow: Math.floor(shoulderPy / 3),
       dist: forwardDist,
     });
 
@@ -705,14 +839,14 @@ export function projectFirstPerson(
           screenPx, headPy, figH,
           selfX, selfY, selfZ, yaw,
           av.x, av.y, av.z,
-          topDrawn, av.uuid,
+          forwardDist, av.uuid,
         );
       }
     }
 
     if (!rendered) {
-      const [ar, ag, ab] = fogRGB(0x30, 0x30, 0x30, forwardDist, MAX_DEPTH);
-      renderPixelAvatar(buf, pw, ph, screenPx, headPy, figH, ar, ag, ab, av.uuid, topDrawn);
+      const [ar, ag, ab] = fogRGB(0x30, 0x30, 0x30, forwardDist, MAX_DEPTH, fogColor);
+      renderPixelAvatar(buf, pw, ph, screenPx, headPy, figH, ar, ag, ab, av.uuid, forwardDist);
     }
   }
 
@@ -722,13 +856,12 @@ export function projectFirstPerson(
     SKY_RGB[0], SKY_RGB[1], SKY_RGB[2],
   );
 
-  // Overlay OIDs from pixel buffer onto cells
-  // For each cell, pick the OID from the most prominent non-undefined pixel
+  // Overlay OIDs from pixel buffer onto cells (2x3 sextant blocks)
   for (let cr = 0; cr < cellRows; cr++) {
     for (let cc = 0; cc < cellCols; cc++) {
-      const px0 = cc * 2, py0 = cr * 2;
+      const px0 = cc * 2, py0 = cr * 3;
       let oid: string | undefined;
-      for (let dy = 0; dy < 2 && !oid; dy++) {
+      for (let dy = 0; dy < 3 && !oid; dy++) {
         for (let dx = 0; dx < 2 && !oid; dx++) {
           const x = px0 + dx, y = py0 + dy;
           if (x < pw && y < ph) {
@@ -782,73 +915,117 @@ function renderPixelAvatar(
   buf: FPPixelBuffer, pw: number, ph: number,
   centerPx: number, headPy: number, figH: number,
   r: number, g: number, b: number, uuid: string,
-  topDrawn: Int32Array,
+  avDepth: number,
 ): void {
-  if (figH <= 2) {
+  if (figH <= 3) {
     // Tiny: just a dot
     for (let dy = 0; dy < figH; dy++) {
-      const py = headPy + dy;
-      if (py >= 0 && py < ph && centerPx >= 0 && centerPx < pw && py < topDrawn[centerPx]) {
-        setFPPixel(buf, centerPx, py, r, g, b, uuid);
-      }
+      setFPPixel(buf, centerPx, headPy + dy, r, g, b, uuid, avDepth);
     }
     return;
   }
 
-  // Proportional humanoid shape
-  const headH = Math.max(1, Math.round(figH * 0.15));
-  const headW = Math.max(1, Math.round(figH * 0.12));
-  const torsoH = Math.max(1, Math.round(figH * 0.35));
-  const torsoW = Math.max(1, Math.round(figH * 0.18));
-  const armW = Math.max(0, Math.round(figH * 0.12));
-  const legH = figH - headH - torsoH;
-  const legW = Math.max(1, Math.round(figH * 0.08));
+  // Proportional humanoid shape with more detail
+  const headH = Math.max(2, Math.round(figH * 0.14));
+  const neckH = Math.max(1, Math.round(figH * 0.03));
+  const torsoH = Math.max(2, Math.round(figH * 0.32));
+  const hipH = Math.max(1, Math.round(figH * 0.06));
+  const legH = Math.max(1, figH - headH - neckH - torsoH - hipH);
+  const headW = Math.max(1, Math.round(figH * 0.10));
+  const neckW = Math.max(1, Math.round(headW * 0.5));
+  const shoulderW = Math.max(2, Math.round(figH * 0.20));
+  const waistW = Math.max(1, Math.round(shoulderW * 0.7));
+  const hipW = Math.max(1, Math.round(shoulderW * 0.85));
+  const armW = Math.max(1, Math.round(figH * 0.05));
+  const legW = Math.max(1, Math.round(figH * 0.06));
+
+  // Skin tone (lighter shade of base)
+  const skinR = Math.min(255, r + 60), skinG = Math.min(255, g + 45), skinB = Math.min(255, b + 35);
+  // Hair (darker)
+  const hairR = Math.max(0, r - 20), hairG = Math.max(0, g - 20), hairB = Math.max(0, b - 15);
+  // Shadow side (slightly darker body)
+  const shadR = Math.max(0, r - 15), shadG = Math.max(0, g - 15), shadB = Math.max(0, b - 12);
 
   let py = headPy;
 
-  // Head (circle-ish: narrower at top/bottom)
+  // Head (oval: narrow top, wide middle, narrow chin)
   for (let dy = 0; dy < headH; dy++, py++) {
-    const w = dy === 0 || dy === headH - 1 ? Math.max(1, headW - 1) : headW;
+    const t = dy / Math.max(1, headH - 1);
+    // Oval profile: wider in middle
+    const w = Math.max(1, Math.round(headW * (1 - 1.5 * (t - 0.45) * (t - 0.45))));
     for (let dx = -w; dx <= w; dx++) {
-      const px = centerPx + dx;
-      if (py >= 0 && py < ph && px >= 0 && px < pw && py < topDrawn[px]) {
-        setFPPixel(buf, px, py, r + 20, g + 15, b + 10, uuid); // slightly lighter head
+      // Hair at top 30%, skin below
+      const isHair = t < 0.3;
+      const isShadow = dx > 0; // right side slightly darker (directional light)
+      if (isHair) {
+        setFPPixel(buf, centerPx + dx, py, hairR, hairG, hairB, uuid, avDepth);
+      } else if (isShadow) {
+        setFPPixel(buf, centerPx + dx, py, Math.max(0, skinR - 15), Math.max(0, skinG - 12), Math.max(0, skinB - 10), uuid, avDepth);
+      } else {
+        setFPPixel(buf, centerPx + dx, py, skinR, skinG, skinB, uuid, avDepth);
       }
     }
   }
 
-  // Torso + arms
-  const armRow = py + Math.floor(torsoH * 0.3);
+  // Neck
+  for (let dy = 0; dy < neckH; dy++, py++) {
+    for (let dx = -neckW; dx <= neckW; dx++) {
+      setFPPixel(buf, centerPx + dx, py, skinR, skinG, skinB, uuid, avDepth);
+    }
+  }
+
+  // Torso (tapers from shoulders to waist) + arms
+  const armStartDy = Math.round(torsoH * 0.05);
+  const armEndDy = Math.round(torsoH * 0.55);
   for (let dy = 0; dy < torsoH && py < headPy + figH; dy++, py++) {
-    // Torso
-    for (let dx = -torsoW; dx <= torsoW; dx++) {
-      const px = centerPx + dx;
-      if (py >= 0 && py < ph && px >= 0 && px < pw && py < topDrawn[px]) {
-        setFPPixel(buf, px, py, r, g, b, uuid);
+    const t = dy / Math.max(1, torsoH - 1);
+    // Taper from shoulder to waist
+    const tw = Math.round(shoulderW + (waistW - shoulderW) * t);
+    for (let dx = -tw; dx <= tw; dx++) {
+      const isShadow = dx > 0;
+      if (isShadow) {
+        setFPPixel(buf, centerPx + dx, py, shadR, shadG, shadB, uuid, avDepth);
+      } else {
+        setFPPixel(buf, centerPx + dx, py, r, g, b, uuid, avDepth);
       }
     }
-    // Arms (at arm row, extending out)
-    if (py >= armRow && py < armRow + Math.max(1, Math.round(torsoH * 0.4))) {
+    // Arms
+    if (dy >= armStartDy && dy < armEndDy) {
+      const armLen = Math.max(1, Math.round(armW + (armEndDy - dy) * 0.2));
       for (let side = -1; side <= 1; side += 2) {
-        for (let ax = 1; ax <= armW; ax++) {
-          const px = centerPx + side * (torsoW + ax);
-          if (py >= 0 && py < ph && px >= 0 && px < pw && py < topDrawn[px]) {
-            setFPPixel(buf, px, py, r - 10, g - 10, b - 10, uuid);
+        for (let ax = 1; ax <= armLen; ax++) {
+          const apx = centerPx + side * (tw + ax);
+          // Arm: skin at lower half (forearm), body color at upper (sleeve)
+          const isForearm = dy > armStartDy + (armEndDy - armStartDy) * 0.6;
+          if (isForearm) {
+            setFPPixel(buf, apx, py, skinR, skinG, skinB, uuid, avDepth);
+          } else {
+            setFPPixel(buf, apx, py, shadR, shadG, shadB, uuid, avDepth);
           }
         }
       }
     }
   }
 
-  // Legs (two columns with gap)
+  // Hips (slightly wider, transition to legs)
+  for (let dy = 0; dy < hipH && py < headPy + figH; dy++, py++) {
+    for (let dx = -hipW; dx <= hipW; dx++) {
+      setFPPixel(buf, centerPx + dx, py, shadR, shadG, shadB, uuid, avDepth);
+    }
+  }
+
+  // Legs (two separate columns that splay slightly)
   for (let dy = 0; dy < legH && py < headPy + figH; dy++, py++) {
-    const gap = Math.min(dy, Math.round(figH * 0.05)) + 1;
+    const splay = Math.min(dy, Math.round(figH * 0.04)) + 1;
     for (let side = -1; side <= 1; side += 2) {
-      const legCenter = centerPx + side * gap;
+      const legCenter = centerPx + side * splay;
       for (let dx = -legW; dx <= legW; dx++) {
-        const px = legCenter + dx;
-        if (py >= 0 && py < ph && px >= 0 && px < pw && py < topDrawn[px]) {
-          setFPPixel(buf, px, py, r - 5, g - 5, b - 5, uuid);
+        // Lower legs = skin tone (bare), upper = clothing
+        const isSkin = dy > legH * 0.7;
+        if (isSkin) {
+          setFPPixel(buf, legCenter + dx, py, skinR, skinG, skinB, uuid, avDepth);
+        } else {
+          setFPPixel(buf, legCenter + dx, py, shadR - 5, shadG - 5, shadB - 5, uuid, avDepth);
         }
       }
     }
@@ -862,7 +1039,7 @@ function renderMeshToPixels(
   centerPx: number, headPy: number, figH: number,
   selfX: number, selfY: number, selfZ: number, yaw: number,
   avX: number, avY: number, avZ: number,
-  topDrawn: Int32Array, uuid: string,
+  avDepth: number, uuid: string,
 ): boolean {
   // Determine render size based on figure height
   const renderH = Math.min(figH * 2, MESH_PIXEL_H);
@@ -912,11 +1089,10 @@ function renderMeshToPixels(
     for (let dx = 0; dx < figW; dx++) {
       const dstPx = startPx + dx;
       if (dstPx < 0 || dstPx >= pw) continue;
-      if (dstPy >= topDrawn[dstPx]) continue;
       const srcX = Math.floor(dx * MESH_PIXEL_W / figW);
       const srcIdx = (srcY * MESH_PIXEL_W + srcX) * 4;
       if (target.color[srcIdx + 3] === 0) continue; // transparent
-      setFPPixel(buf, dstPx, dstPy, target.color[srcIdx], target.color[srcIdx + 1], target.color[srcIdx + 2], uuid);
+      setFPPixel(buf, dstPx, dstPy, target.color[srcIdx], target.color[srcIdx + 1], target.color[srcIdx + 2], uuid, avDepth);
     }
   }
 

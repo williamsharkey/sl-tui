@@ -1,7 +1,7 @@
 // app.ts — TUIApp: owns bridge, tick loop, screen state
 
 import type { ISLBridge, WritableTarget } from './types.js';
-import type { GridFrame } from '../server/grid-state.js';
+import type { GridFrame, ChatBubble } from '../server/grid-state.js';
 import { projectFrame, projectFirstPerson, diffFrames } from '../server/grid-state.js';
 import { computeLayout, type ScreenLayout } from './screen.js';
 import {
@@ -13,9 +13,10 @@ import {
 import { InputHandler, type Mode } from './input.js';
 import { ChatBuffer } from './chat-buffer.js';
 import {
-  createLoginState, renderLoginScreen, nextField,
+  createLoginState, renderLoginScreen, renderLoadingScreen, nextField,
   loginFieldAppend, loginFieldBackspace, type LoginState,
 } from './login-screen.js';
+import { MenuPanel } from './menu.js';
 
 export interface TUIAppOptions {
   bridge: ISLBridge;
@@ -47,6 +48,8 @@ export class TUIApp {
   private lastStatusStr = '';
   private ditherEnabled = false;
   private ditherPhase = 0;
+  private chatBubbles = new Map<string, ChatBubble>();
+  private menu: MenuPanel;
   private autoLogin?: { firstName: string; lastName: string; password: string };
   private createBridge?: () => ISLBridge;
   private onLoginSuccess?: (firstName: string, lastName: string, password: string) => void;
@@ -62,6 +65,36 @@ export class TUIApp {
     this.onLogout = opts.onLogout;
     this.layout = computeLayout(opts.output.columns, opts.output.rows);
     this.loginState = createLoginState();
+
+    this.menu = new MenuPanel({
+      sendIM: async (toUuid, message) => { await this.bridge.sendIM(toUuid, message); },
+      flyToAvatar: (uuid) => { this.bridge.flyToAvatar(uuid); },
+      getProfile: (uuid) => this.bridge.getProfile(uuid),
+      getFriendsList: async () => {
+        const list = await this.bridge.getFriendsList();
+        return list.map(f => ({ uuid: f.uuid, name: f.name, online: f.online }));
+      },
+      teleportHome: async () => {
+        await this.bridge.teleportHome();
+        this.prevFrame = null;
+        this.prevFpFrame = null;
+      },
+      teleportRegion: async (region, x, y, z) => {
+        try {
+          await this.bridge.teleportToRegion(region, x, y, z);
+          this.regionName = this.bridge.getRegionName();
+          this.prevFrame = null;
+          this.prevFpFrame = null;
+          this.chatBuffer.addSystem(`Arrived at ${this.regionName}`);
+        } catch (err: any) {
+          this.chatBuffer.addSystem(`Teleport failed: ${err.message || err}`);
+        }
+        this.renderChat();
+      },
+      stand: () => { this.bridge.stand(); },
+      closeMenu: () => { this.closeMenu(); },
+      systemMessage: (msg) => { this.chatBuffer.addSystem(msg); this.renderChat(); },
+    });
 
     this.inputHandler = new InputHandler({
       onMove: (dir) => this.bridge.move(dir),
@@ -111,6 +144,19 @@ export class TUIApp {
         this.renderInputBar();
       },
       onQuit: () => this.destroy(),
+      onOpenMenu: () => {
+        this.mode = 'menu';
+        this.inputHandler.setMode('menu');
+        this.menu.open();
+        this.renderInputBar();
+      },
+      onMenuKey: (str, key) => {
+        const stayOpen = this.menu.handleKey(str, key);
+        if (!stayOpen) {
+          this.closeMenu();
+        }
+        this.renderInputBar();
+      },
       onLoginChar: (ch) => {
         loginFieldAppend(this.loginState, ch);
         renderLoginScreen(this.output, this.loginState);
@@ -157,8 +203,8 @@ export class TUIApp {
 
     this.loginPending = true;
 
-    this.loginState.error = '';
-    renderLoginScreen(this.output, this.loginState);
+    // Show loading screen immediately
+    renderLoadingScreen(this.output);
 
     try {
       const result = await this.bridge.login(
@@ -169,9 +215,13 @@ export class TUIApp {
           onChat: (from, message, chatType, fromId) => {
             this.chatBuffer.add(from, message);
             this.renderChat();
+            if (fromId) {
+              this.chatBubbles.set(fromId, { message, ts: Date.now() });
+            }
           },
           onIM: (from, fromName, message) => {
             this.chatBuffer.add(`[IM] ${fromName}`, message);
+            this.menu.addIM(from, fromName, message, false);
             this.renderChat();
           },
           onFriendRequest: (from, fromName, message) => {
@@ -195,6 +245,16 @@ export class TUIApp {
 
       this.regionName = result.region;
       this.onLoginSuccess?.(firstName, lastName || 'Resident', password);
+
+      // Region crossing detection
+      this.bridge.onRegionChange(() => {
+        this.prevFrame = null;
+        this.prevFpFrame = null;
+        this.regionName = this.bridge.getRegionName();
+        this.chatBuffer.addSystem(`Entered region: ${this.regionName}`);
+        this.renderChat();
+      });
+
       this.enterGridMode();
     } catch (err: any) {
       this.loginState.error = `Login failed: ${err.message || err}`;
@@ -230,6 +290,25 @@ export class TUIApp {
     // Use body yaw for FP view (tracks turning)
     const selfYaw = this.bridge.getBodyYaw();
 
+    // Region crossing + autopilot + avatar mesh scan
+    this.bridge.checkRegionCrossing();
+    this.bridge.tickFlyTo();
+    this.bridge.triggerAvatarMeshScan();
+
+    // Prune expired chat bubbles (>10s)
+    const now = Date.now();
+    for (const [uuid, bubble] of this.chatBubbles) {
+      if (now - bubble.ts > 10000) this.chatBubbles.delete(uuid);
+    }
+
+    // Build avatar name map for FP labels
+    const avatarNameMap = new Map<string, string>();
+    for (const av of avatars) {
+      if (!av.isSelf) {
+        avatarNameMap.set(av.uuid, `${av.firstName} ${av.lastName}`.trim());
+      }
+    }
+
     // Accumulate all output into a single buffer
     let buf = '';
 
@@ -245,7 +324,11 @@ export class TUIApp {
         avatars,
         objects,
         { selfX: pos.x, selfY: pos.y, selfZ: pos.z, yaw: selfYaw, waterHeight,
-          ditherPhase: this.ditherEnabled ? this.ditherPhase : undefined },
+          ditherPhase: this.ditherEnabled ? this.ditherPhase : undefined,
+          meshLookup: (uuid: string) => this.bridge.getAvatarMeshBundle(uuid),
+          avatarNames: avatarNameMap,
+          chatBubbles: this.chatBubbles,
+          skyColors: this.bridge.getSkyColors() ?? undefined },
         this.layout.fpCols,
         this.layout.fpRows,
       );
@@ -290,6 +373,11 @@ export class TUIApp {
       buf += renderMinimapBuf(this.layout, minimapFrame);
     }
     this.prevFrame = minimapFrame;
+
+    // Menu overlay (renders over FP view when open)
+    if (this.menu.isOpen) {
+      buf += this.menu.render(this.layout);
+    }
 
     // Status bar — only update when values change
     const statusStr = this.buildStatusString(pos);
@@ -338,6 +426,15 @@ export class TUIApp {
     renderInputLine(this.output, this.layout, this.mode, this.chatInput);
   }
 
+  private closeMenu(): void {
+    this.menu.close();
+    this.mode = 'grid';
+    this.inputHandler.setMode('grid');
+    hideCursor(this.output);
+    this.prevFpFrame = null; // force full redraw to clear menu artifacts
+    this.renderInputBar();
+  }
+
   private async handleChatCommand(text: string): Promise<void> {
     if (text.startsWith('/tp ')) {
       const args = text.slice(4).trim();
@@ -365,6 +462,7 @@ export class TUIApp {
       const match = text.match(/^\/im\s+(\S+)\s+(.*)/);
       if (match) {
         await this.bridge.sendIM(match[1], match[2]);
+        this.menu.addIM(match[1], match[1], match[2], true);
         this.chatBuffer.addSystem(`IM sent to ${match[1]}`);
       } else {
         this.chatBuffer.addSystem('Usage: /im <uuid> <message>');
@@ -405,6 +503,7 @@ export class TUIApp {
     this.regionName = '';
     this.chatInput = '';
     this.chatBuffer = new ChatBuffer();
+    this.chatBubbles = new Map();
     this.loginState = createLoginState();
 
     // Notify callback (for clearing saved credentials)
@@ -442,6 +541,30 @@ export class TUIApp {
     this.inputHandler.handleKey(str, key as any);
   }
 
+  private resizeTimer: ReturnType<typeof setTimeout> | null = null;
+
+  handleResize(cols: number, rows: number): void {
+    this.layout = computeLayout(cols, rows);
+    // Invalidate frames immediately so the next tick doesn't diff against old dimensions
+    this.prevFrame = null;
+    this.prevFpFrame = null;
+    this.lastStatusStr = '';
+
+    // Debounce the full clear+redraw: wait 150ms after last resize event
+    if (this.resizeTimer) clearTimeout(this.resizeTimer);
+    this.resizeTimer = setTimeout(() => {
+      this.resizeTimer = null;
+      this.layout = computeLayout(cols, rows);
+      this.prevFrame = null;
+      this.prevFpFrame = null;
+      this.lastStatusStr = '';
+      // Full clear + redraw everything including separator, chat, input
+      if (this.mode === 'grid' || this.mode === 'chat-input' || this.mode === 'menu') {
+        this.renderFull();
+      }
+    }, 150);
+  }
+
   getMode(): Mode { return this.mode; }
   getChatBuffer(): ChatBuffer { return this.chatBuffer; }
   getLayout(): ScreenLayout { return this.layout; }
@@ -452,4 +575,5 @@ export class TUIApp {
   getChatInput(): string { return this.chatInput; }
   getPrevFrame(): GridFrame | null { return this.prevFrame; }
   isLoginPending(): boolean { return this.loginPending; }
+  getMenu(): MenuPanel { return this.menu; }
 }

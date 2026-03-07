@@ -18,6 +18,6 @@
       "node-metaverse/*": ["./vendor/node-metaverse/*"]
     }
   },
-  "include": ["server/**/*.ts", "vendor/**/*.ts"],
+  "include": ["server/**/*.ts", "tui/**/*.ts", "vendor/**/*.ts"],
   "exclude": ["node_modules", "dist"]
 }

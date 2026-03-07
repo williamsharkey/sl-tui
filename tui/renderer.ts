@@ -16,6 +16,7 @@ const SHOW_CURSOR = `${ESC}?25h`;
 const ALT_SCREEN_ON = `${ESC}?1049h`;
 const ALT_SCREEN_OFF = `${ESC}?1049l`;
 const RESET = `${ESC}0m`;
+const RESET_BG = `${ESC}49m`; // reset bg to default terminal bg
 
 function moveTo(row: number, col: number): string {
   return `${ESC}${row + 1};${col + 1}H`;
@@ -61,11 +62,34 @@ function hex256(hex: string): number {
   return v;
 }
 
+// Truecolor mode: use 24-bit RGB escape sequences for full color range
+let _truecolor = true;
+export function setTruecolor(enabled: boolean): void { _truecolor = enabled; }
+
+const fgTrueCache = new Map<string, string>();
+const bgTrueCache = new Map<string, string>();
+
 function fgColor(hex: string): string {
+  if (_truecolor) {
+    let cached = fgTrueCache.get(hex);
+    if (cached) return cached;
+    const [r, g, b] = hexToRgb(hex);
+    cached = `${ESC}38;2;${r};${g};${b}m`;
+    fgTrueCache.set(hex, cached);
+    return cached;
+  }
   return `${ESC}38;5;${hex256(hex)}m`;
 }
 
 function bgColor(hex: string): string {
+  if (_truecolor) {
+    let cached = bgTrueCache.get(hex);
+    if (cached) return cached;
+    const [r, g, b] = hexToRgb(hex);
+    cached = `${ESC}48;2;${r};${g};${b}m`;
+    bgTrueCache.set(hex, cached);
+    return cached;
+  }
   return `${ESC}48;5;${hex256(hex)}m`;
 }
 
@@ -121,36 +145,65 @@ export function renderMinimap(
   out.write(renderMinimapBuf(layout, frame));
 }
 
+// Minimap: opaque dark background for all cells
+const MINIMAP_TERRAIN = new Set(['.', ',', '~', ':', ' ']);
+const MINIMAP_BG_HEX = '#101018';
+const BORDER_COLOR_HEX = '#505050';
+
 export function renderMinimapBuf(
   layout: ScreenLayout,
   frame: GridFrame,
 ): string {
   let buf = '';
-  for (let row = 0; row < layout.minimapRows && row < frame.rows; row++) {
-    buf += moveTo(layout.minimapTop + row, layout.minimapLeft);
+  const mTop = layout.minimapTop;
+  const mLeft = layout.minimapLeft;
+  const mRows = Math.min(layout.minimapRows, frame.rows);
+  const mCols = Math.min(layout.minimapCols, frame.cols);
+  const darkBg = bgColor(MINIMAP_BG_HEX);
+
+  for (let row = 0; row < mRows; row++) {
+    buf += moveTo(mTop + row, mLeft);
     if (_bwMode) {
-      for (let col = 0; col < layout.minimapCols && col < frame.cols; col++) {
-        buf += frame.cells[row * frame.cols + col].char;
+      for (let col = 0; col < mCols; col++) {
+        const cell = frame.cells[row * frame.cols + col];
+        const isBorder = row === 0 || row === mRows - 1 || col === 0 || col === mCols - 1;
+        const isContent = !MINIMAP_TERRAIN.has(cell.char);
+        buf += isBorder && !isContent ? '·' : cell.char;
       }
     } else {
+      buf += darkBg;
       let lastFg = '';
-      let lastBg = '';
-      for (let col = 0; col < layout.minimapCols && col < frame.cols; col++) {
+      for (let col = 0; col < mCols; col++) {
         const cell = frame.cells[row * frame.cols + col];
-        if (cell.fg !== lastFg) {
-          buf += fgColor(cell.fg);
-          lastFg = cell.fg;
+        const isBorder = row === 0 || row === mRows - 1 || col === 0 || col === mCols - 1;
+        const isContent = !MINIMAP_TERRAIN.has(cell.char);
+
+        if (isBorder && !isContent) {
+          if (lastFg !== BORDER_COLOR_HEX) {
+            buf += fgColor(BORDER_COLOR_HEX);
+            lastFg = BORDER_COLOR_HEX;
+          }
+          buf += '·';
+        } else {
+          if (lastFg !== cell.fg) {
+            buf += fgColor(cell.fg);
+            lastFg = cell.fg;
+          }
+          buf += cell.char;
         }
-        if (cell.bg !== lastBg) {
-          buf += bgColor(cell.bg);
-          lastBg = cell.bg;
-        }
-        buf += cell.char;
       }
       buf += RESET;
     }
   }
   return buf;
+}
+
+// Check if a screen position falls inside the minimap region
+export function inMinimap(layout: ScreenLayout, screenRow: number, col: number): boolean {
+  return screenRow >= layout.minimapTop &&
+    screenRow < layout.minimapTop + layout.minimapRows &&
+    col >= layout.minimapLeft &&
+    col < layout.minimapLeft + layout.minimapCols;
 }
 
 export function renderFpView(
@@ -161,7 +214,7 @@ export function renderFpView(
   out.write(renderFpViewBuf(layout, frame));
 }
 
-// Render FP view to buffer, skipping cells that overlap the minimap region
+// Render FP view to buffer — full width, skips minimap region to avoid overdraw
 export function renderFpViewBuf(
   layout: ScreenLayout,
   frame: GridFrame,
@@ -172,21 +225,21 @@ export function renderFpViewBuf(
   const renderCols = layout.fpCols || layout.totalCols;
   for (let row = 0; row < layout.fpRows && row < frame.rows; row++) {
     const screenRow = layout.fpTop + row;
-    const inMinimapRowRange = skipMinimap &&
+    // Determine if this row overlaps the minimap
+    const inMinimapRow = skipMinimap &&
       screenRow >= layout.minimapTop &&
       screenRow < layout.minimapTop + layout.minimapRows;
+    const colLimit = inMinimapRow ? Math.min(renderCols, layout.minimapLeft) : renderCols;
 
     buf += moveTo(screenRow, 0);
     if (_bwMode) {
-      for (let col = 0; col < renderCols && col < frame.cols; col++) {
-        if (inMinimapRowRange && col >= layout.minimapLeft) break;
+      for (let col = 0; col < colLimit && col < frame.cols; col++) {
         buf += frame.cells[row * frame.cols + col].char;
       }
     } else {
       let lastFg = '';
       let lastBg = '';
-      for (let col = 0; col < renderCols && col < frame.cols; col++) {
-        if (inMinimapRowRange && col >= layout.minimapLeft) break;
+      for (let col = 0; col < colLimit && col < frame.cols; col++) {
         const cell = frame.cells[row * frame.cols + col];
         if (cell.fg !== lastFg) {
           buf += fgColor(cell.fg);
@@ -209,7 +262,6 @@ export function renderFpDeltaBuf(
   layout: ScreenLayout,
   deltas: import('../server/grid-state.js').CellDelta[],
   frame: GridFrame,
-  skipMinimap = true,
 ): string {
   if (deltas.length === 0) return '';
   let buf = '';
@@ -217,17 +269,11 @@ export function renderFpDeltaBuf(
     const row = Math.floor(d.idx / frame.cols);
     const col = d.idx % frame.cols;
     const screenRow = layout.fpTop + row;
-    const screenCol = col;
 
-    // Skip cells in minimap region
-    if (skipMinimap &&
-        screenRow >= layout.minimapTop &&
-        screenRow < layout.minimapTop + layout.minimapRows &&
-        screenCol >= layout.minimapLeft) {
-      continue;
-    }
+    // Skip deltas that fall inside the minimap region
+    if (inMinimap(layout, screenRow, col)) continue;
 
-    buf += moveTo(screenRow, screenCol);
+    buf += moveTo(screenRow, col);
     if (_bwMode) {
       buf += d.char;
     } else {
@@ -267,14 +313,16 @@ export function renderChatLines(
 export function renderInputLine(
   out: WritableTarget,
   layout: ScreenLayout,
-  mode: 'grid' | 'chat-input' | 'login',
+  mode: 'grid' | 'chat-input' | 'login' | 'menu',
   inputText: string,
 ): void {
   let content: string;
   if (mode === 'chat-input') {
     content = `Say: ${inputText}\u2588`;
+  } else if (mode === 'menu') {
+    content = ' / Menu \u2502 Esc:back  letter:select';
   } else if (mode === 'grid') {
-    content = ' W/S:fwd/back A/D:strafe \u2190\u2192:turn Space:jump F:fly V:dither Enter:chat Q:quit';
+    content = ' W/S:fwd/back A/D:strafe \u2190\u2192:turn Space:jump F:fly /:menu Enter:chat Q:quit';
   } else {
     content = '';
   }

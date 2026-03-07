@@ -4,7 +4,7 @@
 import { SLBridge } from '../server/sl-bridge.js';
 import { TUIApp } from './app.js';
 import { computeLayout } from './screen.js';
-import { setBwMode } from './renderer.js';
+import { setBwMode, setTruecolor } from './renderer.js';
 import { loadCredentials, saveCredentials, clearCredentials } from './credentials.js';
 import type { WritableTarget } from './types.js';
 
@@ -15,10 +15,13 @@ let lastName = 'Resident';
 let password = '';
 
 let bw = false;
+let use256 = false;
 
 for (let i = 0; i < args.length; i++) {
   if (args[i] === '--bw') {
     bw = true;
+  } else if (args[i] === '--256') {
+    use256 = true;
   } else if ((args[i] === '--username' || args[i] === '-u') && args[i + 1]) {
     const name = args[++i];
     if (name.includes(' ')) {
@@ -61,6 +64,7 @@ if (!firstName && !password) {
 }
 
 if (bw) setBwMode(true);
+if (use256) setTruecolor(false);
 
 // Create stdout WritableTarget
 const stdoutTarget: WritableTarget = {
@@ -95,8 +99,7 @@ const app = new TUIApp({
 
 // Handle resize
 process.stdout.on('resize', () => {
-  (app as any).prevFrame = null;
-  (app as any).layout = computeLayout(process.stdout.columns, process.stdout.rows);
+  app.handleResize(process.stdout.columns, process.stdout.rows);
 });
 
 app.start().catch((err) => {

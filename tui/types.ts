@@ -1,6 +1,7 @@
 // types.ts — ISLBridge interface and WritableTarget for TUI
 
 import type { AvatarData, ObjectData } from '../server/grid-state.js';
+import type { AvatarMeshBundle } from '../server/avatar-cache.js';
 
 export interface WritableTarget {
   write(data: string): void;
@@ -51,6 +52,14 @@ export interface ISLBridge {
   inspectObject(uuid: string): { name: string; description: string; owner: string; position: string } | null;
   inspectAvatar(uuid: string): { name: string; title: string; position: string } | null;
   getFriendsList(): Promise<{ uuid: string; name: string; online: boolean; rightsGiven: boolean; rightsHas: boolean }[]>;
+  flyToAvatar(uuid: string): void;
+  cancelFlyTo(): void;
+  tickFlyTo(): boolean;
+  onRegionChange(cb: () => void): void;
+  checkRegionCrossing(): void;
+  triggerAvatarMeshScan(): void;
+  getSkyColors(): { zenith: [number, number, number]; horizon: [number, number, number]; sunDir: [number, number, number] } | null;
+  getAvatarMeshBundle(uuid: string): AvatarMeshBundle | null;
   startTick(callback: () => void, hz?: number): void;
   stopTick(): void;
   close(): Promise<void>;

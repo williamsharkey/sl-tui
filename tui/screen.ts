@@ -39,9 +39,9 @@ export function computeLayout(cols: number, rows: number): ScreenLayout {
   const fpRows = Math.max(1, fpBottom - fpTop + 1);
   const fpCols = cols;
 
-  // Minimap: upper-right corner, ~25% width, ~40% height of FP area
-  const minimapCols = Math.max(8, Math.floor(cols * 0.25));
-  const minimapRows = Math.max(4, Math.floor(fpRows * 0.4));
+  // Minimap: upper-right corner, 1/8 width × 1/5 height
+  const minimapCols = Math.max(8, Math.floor(cols / 8));
+  const minimapRows = Math.max(4, Math.floor(fpRows / 5));
   const minimapLeft = cols - minimapCols;
   const minimapTop = fpTop;
 
