@@ -176,11 +176,12 @@ function simToGridRotated(
 ): { col: number; row: number } | null {
   const dx = simX - params.selfX;
   const dy = simY - params.selfY;
-  // Rotate by -yaw so facing direction maps to screen-up
-  const rx = dx * cosY + dy * sinY;
-  const ry = -dx * sinY + dy * cosY;
-  const col = Math.round(params.cols / 2 + rx / params.metersPerCell);
-  const row = Math.round(params.rows / 2 - ry / params.metersPerCell);
+  // Project onto right (screen-col) and forward (screen-row-up) axes
+  // Right = (sin(yaw), -cos(yaw)), Forward = (cos(yaw), sin(yaw))
+  const rightComponent = dx * sinY - dy * cosY;
+  const forwardComponent = dx * cosY + dy * sinY;
+  const col = Math.round(params.cols / 2 + rightComponent / params.metersPerCell);
+  const row = Math.round(params.rows / 2 - forwardComponent / params.metersPerCell);
   if (col < 0 || col >= params.cols || row < 0 || row >= params.rows) return null;
   return { col, row };
 }
@@ -194,8 +195,8 @@ function placeCompassLabel(
   // Direction in rotated screen space
   const dx = Math.cos(worldAngle);
   const dy = Math.sin(worldAngle);
-  const rx = dx * cosY + dy * sinY;
-  const ry = -dx * sinY + dy * cosY;
+  const rx = dx * sinY - dy * cosY;   // right component
+  const ry = dx * cosY + dy * sinY;   // forward component
   // Project to edge: find where ray hits border
   const halfC = cols / 2 - 1;
   const halfR = rows / 2 - 1;
@@ -228,12 +229,13 @@ export function projectFrame(
   // 1. Terrain layer — sample in rotated screen space
   for (let row = 0; row < rows; row++) {
     for (let col = 0; col < cols; col++) {
-      // Screen offset from center
+      // Screen offset: sx = right, sy = forward (up on screen)
       const sx = (col - cols / 2) * metersPerCell;
       const sy = (rows / 2 - row) * metersPerCell;
       // Inverse-rotate back to world coords
-      const simX = selfX + sx * cosY - sy * sinY;
-      const simY = selfY + sx * sinY + sy * cosY;
+      // sx = dx*sinY - dy*cosY, sy = dx*cosY + dy*sinY
+      const simX = selfX + sx * sinY + sy * cosY;
+      const simY = selfY - sx * cosY + sy * sinY;
       if (simX >= 0 && simX < 256 && simY >= 0 && simY < 256) {
         const h = terrain(Math.floor(simX), Math.floor(simY));
         frame.cells[row * cols + col] = terrainCell(h, waterHeight);
@@ -319,9 +321,9 @@ export function projectFrame(
 
     const dx = av.x - selfX;
     const dy = av.y - selfY;
-    // Rotate into screen space
-    const rx = dx * cosY + dy * sinY;
-    const ry = -dx * sinY + dy * cosY;
+    // Project onto screen axes: right (col) and forward (row-up)
+    const rx = dx * sinY - dy * cosY;   // right component → screen col
+    const ry = dx * cosY + dy * sinY;   // forward component → screen up
     const angle = Math.atan2(ry, rx);
     const deg = ((angle * 180 / Math.PI) + 360) % 360;
 
@@ -532,9 +534,11 @@ export function projectFirstPerson(
 
   // Cast one ray per pixel column
   for (let pcol = 0; pcol < pw; pcol++) {
-    // Ray angle: fan out from -HALF_FOV to +HALF_FOV across the screen
-    const screenX = (pcol / pw) * 2 - 1;  // -1 to +1
-    const rayAngle = yaw + Math.atan(screenX * Math.tan(HALF_FOV));
+    // Ray angle: fan out across the screen
+    // pcol=0 → left of screen → avatar's left → yaw + HALF_FOV (CCW)
+    // pcol=pw → right of screen → avatar's right → yaw - HALF_FOV (CW)
+    const screenFrac = pcol / (pw - 1);  // 0 to 1
+    const rayAngle = yaw + HALF_FOV - screenFrac * FOV;
     const rayDirX = Math.cos(rayAngle);
     const rayDirY = Math.sin(rayAngle);
 
@@ -610,9 +614,10 @@ export function projectFirstPerson(
     if (forwardDist < NEAR || forwardDist > MAX_DEPTH) return null;
 
     const lateralDist = dx * rightX + dy * rightY;
-    // Perspective projection: screen X from lateral/forward ratio
-    const screenX = (lateralDist / forwardDist) / Math.tan(HALF_FOV);
-    const px = Math.round((screenX + 1) * 0.5 * pw);
+    // Perspective projection: positive lateral = right in world → right on screen (high px)
+    const angleOffset = Math.atan2(lateralDist, forwardDist);
+    const screenFrac = 0.5 + angleOffset / FOV;
+    const px = Math.round(screenFrac * pw);
     if (px < 0 || px >= pw) return null;
 
     const heightOnScreen = ((CAMERA_HEIGHT - wz) / forwardDist) * ph;
