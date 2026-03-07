@@ -310,11 +310,17 @@ export class Session {
     }
     this.prevFrame = frame;
 
+    // Trigger periodic avatar mesh scan
+    this.bridge.triggerAvatarMeshScan();
+
     // First-person view (main view for web client)
     const selfYaw = this.bridge.getBodyYaw();
     const fpFrame = projectFirstPerson(
       terrainFn, avatars, objects,
-      { selfX: pos.x, selfY: pos.y, selfZ: pos.z, yaw: selfYaw, waterHeight },
+      {
+        selfX: pos.x, selfY: pos.y, selfZ: pos.z, yaw: selfYaw, waterHeight,
+        meshLookup: (uuid: string) => this.bridge.getAvatarMeshBundle(uuid),
+      },
       this.cols, this.fpRows,
     );
 

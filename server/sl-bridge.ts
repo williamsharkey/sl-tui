@@ -17,6 +17,8 @@ import type { Avatar } from '../vendor/node-metaverse/classes/public/Avatar.js';
 import type { GameObject } from '../vendor/node-metaverse/classes/public/GameObject.js';
 import type { AvatarData, ObjectData } from './grid-state.js';
 import type { Subscription } from 'rxjs';
+import { AvatarCache } from './avatar-cache.js';
+import type { AvatarMeshBundle } from './avatar-cache.js';
 
 export interface BridgeCallbacks {
   onChat: (from: string, message: string, chatType: number, fromId: string) => void;
@@ -34,6 +36,8 @@ export class SLBridge {
   private pendingFriendRequests = new Map<string, FriendRequestEvent>();
   private pendingLures = new Map<string, LureEvent>();
   private _flying = false;
+  private avatarCache = new AvatarCache();
+  private _avatarScanAge = 0;
 
   // Caches to avoid per-tick allocations and redundant work
   private _selfId: string = '';
@@ -87,6 +91,8 @@ export class SLBridge {
     // Cache self ID (avoid toString() every tick)
     this._selfId = this.bot.agent.agentID.toString();
 
+    // Attach avatar mesh cache
+    this.avatarCache.attach(this.bot);
 
     // Subscribe to events
     this.subscriptions.push(
@@ -652,6 +658,19 @@ export class SLBridge {
     return results;
   }
 
+  // Avatar mesh data
+  getAvatarMeshBundle(uuid: string): AvatarMeshBundle | null {
+    return this.avatarCache.getMeshBundle(uuid);
+  }
+
+  // Periodic avatar mesh scan (call from tick at lower frequency)
+  triggerAvatarMeshScan(): void {
+    const now = performance.now();
+    if (now - this._avatarScanAge < 10000) return; // every 10s
+    this._avatarScanAge = now;
+    this.avatarCache.scanAll().catch(() => {});
+  }
+
   // Expose the raw bot for testing
   getBot(): Bot | null {
     return this.bot;
@@ -679,6 +698,7 @@ export class SLBridge {
     this._objectCache = [];
     this._serverPos = null;
     this._displayPos = null;
+    this.avatarCache.detach();
     if (this.bot) {
       try {
         await this.bot.close();
