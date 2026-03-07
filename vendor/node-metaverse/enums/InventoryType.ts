@@ -1,0 +1,25 @@
+export enum InventoryType
+{
+    Unknown = -1,
+    Texture = 0,
+    Sound = 1,
+    CallingCard = 2,
+    Landmark = 3,
+    Object = 6,
+    Notecard = 7,
+    Category = 8,
+    RootCategory = 9,
+    LSL = 10,
+    Snapshot = 15,
+    Attachment = 17,
+    Wearable = 18,
+    Animation = 19,
+    Gesture = 20,
+    Mesh = 22,
+    Widget = 23,
+    Person = 24,
+    Settings = 25,
+    Material = 26,
+    GLTF = 27,
+    GLTFBin = 28
+}

@@ -1,0 +1,23 @@
+export enum LLSDTokenType
+{
+    Unknown = 0,
+    Whitespace = 1,
+    Null = 2,
+    MapStart = 3,
+    MapEnd = 4,
+    Colon = 5,
+    Comma = 6,
+    ArrayStart = 7,
+    ArrayEnd = 8,
+    Boolean = 9,
+    Integer = 10,
+    Real = 11,
+    UUID = 12,
+    StringFixedSingle = 13,
+    StringFixedDouble = 14,
+    StringDynamicStart = 15,
+    URI = 16,
+    Date = 17,
+    BinaryStatic = 18,
+    BinaryDynamicStart = 19,
+}
