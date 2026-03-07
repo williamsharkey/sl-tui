@@ -100,6 +100,7 @@ export class MenuPanel {
 
   close(): void {
     this.stack = [];
+    this.prevPanelRows = 0;
   }
 
   addIM(peerUuid: string, peerName: string, message: string, outgoing: boolean): void {
@@ -566,6 +567,7 @@ export class MenuPanel {
   }
 
   // --- Rendering ---
+  private prevPanelRows = 0; // track previous render height to clear stale rows
 
   render(layout: ScreenLayout): string {
     if (!this.isOpen) return '';
@@ -573,9 +575,22 @@ export class MenuPanel {
     const maxPanelH = Math.max(6, layout.fpRows - 2);
     const maxContent = maxPanelH - 3; // top border + footer + bottom border
     const { title, lines, footer } = this.buildCurrentPanel(maxContent);
-    // Clamp lines to maxContent
     const clampedLines = lines.slice(0, maxContent);
-    return this.drawPanel(layout, panelW, title, clampedLines, footer);
+    const totalRows = clampedLines.length + 3; // top border + content + footer + bottom border
+
+    let buf = this.drawPanel(layout, panelW, title, clampedLines, footer);
+
+    // Clear stale rows from previous larger panel
+    if (this.prevPanelRows > totalRows) {
+      const left = Math.max(0, Math.floor((layout.totalCols - panelW) / 2));
+      const startClear = layout.fpTop + 1 + totalRows;
+      for (let r = startClear; r < layout.fpTop + 1 + this.prevPanelRows; r++) {
+        buf += moveTo(r, left) + ' '.repeat(panelW);
+      }
+    }
+    this.prevPanelRows = totalRows;
+
+    return buf;
   }
 
   private drawPanel(
