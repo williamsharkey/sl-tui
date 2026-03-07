@@ -136,14 +136,13 @@ export class TUIApp {
     }
 
     if (this.autoLogin) {
+      // Pre-fill fields but don't auto-login — user must press Enter
       this.loginState.firstName = this.autoLogin.firstName;
       this.loginState.lastName = this.autoLogin.lastName;
       this.loginState.password = this.autoLogin.password;
-      await this.attemptLogin();
-    } else {
-      this.inputHandler.setMode('login');
-      renderLoginScreen(this.output, this.loginState);
     }
+    this.inputHandler.setMode('login');
+    renderLoginScreen(this.output, this.loginState);
   }
 
   private async attemptLogin(): Promise<void> {

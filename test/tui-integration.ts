@@ -232,6 +232,14 @@ function sleep(ms: number): Promise<void> {
   return new Promise(r => setTimeout(r, ms));
 }
 
+// Helper: start app with autoLogin and press Enter to trigger login
+async function startAndLogin(app: TUIApp): Promise<void> {
+  await app.start();
+  // autoLogin pre-fills fields but no longer auto-submits — press Enter
+  app.simulateKey(undefined, { name: 'return' });
+  await sleep(50);
+}
+
 // ─── Tests ───────────────────────────────────────────────────────
 
 async function runTests() {
@@ -248,8 +256,7 @@ async function runTests() {
       autoLogin: { firstName: 'Test', lastName: 'User', password: 'pass' },
     });
 
-    await app.start();
-    await sleep(50);
+    await startAndLogin(app);
 
     assert(bridge.logged, 'Bridge not logged in');
     assertEqual(app.getMode(), 'grid');
@@ -271,8 +278,7 @@ async function runTests() {
       autoLogin: { firstName: 'Test', lastName: 'User', password: 'pass' },
     });
 
-    await app.start();
-    await sleep(50);
+    await startAndLogin(app);
 
     // Strip all ANSI escape sequences for content check
     const plain = buf.data.replace(/\x1b\[[^A-Za-z]*[A-Za-z]/g, '').replace(/\x1b\[\?[^A-Za-z]*[A-Za-z]/g, '');
@@ -292,8 +298,7 @@ async function runTests() {
       autoLogin: { firstName: 'Test', lastName: 'User', password: 'pass' },
     });
 
-    await app.start();
-    await sleep(50);
+    await startAndLogin(app);
 
     app.simulateKey(undefined, { name: 'up' });
     app.simulateKey('d', { name: 'd' });
@@ -313,8 +318,7 @@ async function runTests() {
       autoLogin: { firstName: 'Test', lastName: 'User', password: 'pass' },
     });
 
-    await app.start();
-    await sleep(50);
+    await startAndLogin(app);
 
     assert(!bridge.flying, 'Should not be flying initially');
     app.simulateKey('f', { name: 'f' });
@@ -336,8 +340,7 @@ async function runTests() {
       autoLogin: { firstName: 'Test', lastName: 'User', password: 'pass' },
     });
 
-    await app.start();
-    await sleep(50);
+    await startAndLogin(app);
 
     // Enter chat mode
     app.simulateKey(undefined, { name: 'return' });
@@ -365,8 +368,7 @@ async function runTests() {
       autoLogin: { firstName: 'Test', lastName: 'User', password: 'pass' },
     });
 
-    await app.start();
-    await sleep(50);
+    await startAndLogin(app);
 
     app.simulateKey(undefined, { name: 'return' }); // enter chat
     app.simulateKey('h', { name: 'h' }); // type
@@ -387,8 +389,7 @@ async function runTests() {
       autoLogin: { firstName: 'Test', lastName: 'User', password: 'pass' },
     });
 
-    await app.start();
-    await sleep(50);
+    await startAndLogin(app);
 
     bridge.simulateChat('Alice', 'Hey there!');
     await sleep(50);
@@ -409,8 +410,7 @@ async function runTests() {
       autoLogin: { firstName: 'Test', lastName: 'User', password: 'pass' },
     });
 
-    await app.start();
-    await sleep(50);
+    await startAndLogin(app);
 
     bridge.simulateIM('Bob', 'Private message');
     await sleep(50);
@@ -433,8 +433,7 @@ async function runTests() {
       autoLogin: { firstName: 'Test', lastName: 'User', password: 'pass' },
     });
 
-    await app.start();
-    await sleep(50);
+    await startAndLogin(app);
 
     const dataBefore = buf.data.length;
 
@@ -459,8 +458,7 @@ async function runTests() {
       autoLogin: { firstName: 'Test', lastName: 'User', password: 'pass' },
     });
 
-    await app.start();
-    await sleep(50);
+    await startAndLogin(app);
 
     // Enter chat, type /tp command
     app.simulateKey(undefined, { name: 'return' });
@@ -487,8 +485,7 @@ async function runTests() {
     });
 
     // 1. Login
-    await app.start();
-    await sleep(50);
+    await startAndLogin(app);
     assert(bridge.logged, 'Not logged in');
     assertEqual(app.getMode(), 'grid');
 
@@ -524,8 +521,7 @@ async function runTests() {
         autoLogin: { firstName: 'Test', lastName: 'User', password: 'pass' },
       });
 
-      await app.start();
-      await sleep(50);
+      await startAndLogin(app);
 
       assert(buf.data.length > 0, `No output for ${cols}x${rows}`);
       const layout = app.getLayout();
@@ -547,8 +543,7 @@ async function runTests() {
       autoLogin: { firstName: 'Test', lastName: 'User', password: 'pass' },
     });
 
-    await app.start();
-    await sleep(50);
+    await startAndLogin(app);
 
     const layout = app.getLayout();
     assert(layout.gridRows >= 1, `gridRows should be >= 1, got ${layout.gridRows}`);
@@ -567,8 +562,7 @@ async function runTests() {
     });
 
     // Should not throw
-    await app.start();
-    await sleep(50);
+    await startAndLogin(app);
 
     const layout = app.getLayout();
     assert(layout.gridRows >= 1, `gridRows should be >= 1, got ${layout.gridRows}`);
@@ -589,8 +583,7 @@ async function runTests() {
       autoLogin: { firstName: 'Test', lastName: 'User', password: 'pass' },
     });
 
-    await app.start();
-    await sleep(50);
+    await startAndLogin(app);
 
     assertEqual(app.getMode(), 'login');
     assert(buf.contains('Login failed'), 'Should show login error');
@@ -608,8 +601,7 @@ async function runTests() {
       autoLogin: { firstName: 'Test', lastName: '', password: '' },
     });
 
-    await app.start();
-    await sleep(50);
+    await startAndLogin(app);
 
     assertEqual(app.getMode(), 'login');
     assert(buf.contains('required'), 'Should show validation error');
@@ -627,7 +619,6 @@ async function runTests() {
     });
 
     await app.start();
-    await sleep(50);
 
     // Manually set login state and simulate rapid Enter presses
     // Enter login fields first
@@ -656,8 +647,7 @@ async function runTests() {
       autoLogin: { firstName: 'Test', lastName: 'User', password: 'pass' },
     });
 
-    await app.start();
-    await sleep(50);
+    await startAndLogin(app);
 
     app.simulateKey(undefined, { name: 'return' });
     for (const ch of '/tp Region abc def') {
@@ -681,8 +671,7 @@ async function runTests() {
       autoLogin: { firstName: 'Test', lastName: 'User', password: 'pass' },
     });
 
-    await app.start();
-    await sleep(50);
+    await startAndLogin(app);
 
     app.simulateKey(undefined, { name: 'return' });
     for (const ch of '/im') {
@@ -706,8 +695,7 @@ async function runTests() {
       autoLogin: { firstName: 'Test', lastName: 'User', password: 'pass' },
     });
 
-    await app.start();
-    await sleep(50);
+    await startAndLogin(app);
 
     app.simulateKey(undefined, { name: 'return' });
     for (const ch of '/im some-uuid') {
@@ -731,8 +719,7 @@ async function runTests() {
       autoLogin: { firstName: 'Test', lastName: 'User', password: 'pass' },
     });
 
-    await app.start();
-    await sleep(50);
+    await startAndLogin(app);
 
     // Enter chat mode and immediately submit (empty)
     app.simulateKey(undefined, { name: 'return' });
@@ -753,8 +740,7 @@ async function runTests() {
       autoLogin: { firstName: 'Test', lastName: 'User', password: 'pass' },
     });
 
-    await app.start();
-    await sleep(50);
+    await startAndLogin(app);
 
     app.simulateKey(undefined, { name: 'return' }); // enter chat
     app.simulateKey(undefined, { name: 'backspace' }); // backspace on empty
@@ -777,8 +763,7 @@ async function runTests() {
       autoLogin: { firstName: 'Test', lastName: 'User', password: 'pass' },
     });
 
-    await app.start();
-    await sleep(50);
+    await startAndLogin(app);
 
     bridge.setNullPosition();
     // Should not throw
@@ -798,8 +783,7 @@ async function runTests() {
       autoLogin: { firstName: 'Test', lastName: 'User', password: 'pass' },
     });
 
-    await app.start();
-    await sleep(50);
+    await startAndLogin(app);
     await app.destroy();
 
     const dataAfterDestroy = buf.data.length;
@@ -816,8 +800,7 @@ async function runTests() {
       autoLogin: { firstName: 'Test', lastName: 'User', password: 'pass' },
     });
 
-    await app.start();
-    await sleep(50);
+    await startAndLogin(app);
 
     await app.destroy();
     await app.destroy(); // should not throw
@@ -835,8 +818,7 @@ async function runTests() {
       autoLogin: { firstName: 'Test', lastName: 'User', password: 'pass' },
     });
 
-    await app.start();
-    await sleep(50);
+    await startAndLogin(app);
 
     // Enter chat, type something
     app.simulateKey(undefined, { name: 'return' });
@@ -865,8 +847,7 @@ async function runTests() {
       autoLogin: { firstName: 'Test', lastName: 'User', password: 'pass' },
     });
 
-    await app.start();
-    await sleep(50);
+    await startAndLogin(app);
 
     for (let i = 0; i < 10; i++) {
       app.simulateKey(undefined, { name: 'up' });
@@ -888,8 +869,7 @@ async function runTests() {
       autoLogin: { firstName: 'Test', lastName: 'User', password: 'pass' },
     });
 
-    await app.start();
-    await sleep(50);
+    await startAndLogin(app);
 
     const plain = buf.getPlainText();
     assert(plain.includes('@'), 'Grid must contain self @');
@@ -906,8 +886,7 @@ async function runTests() {
       autoLogin: { firstName: 'Test', lastName: 'User', password: 'pass' },
     });
 
-    await app.start();
-    await sleep(50);
+    await startAndLogin(app);
 
     const layout = app.getLayout();
     assert(layout.fpRows >= 3, `FP view should have >= 3 rows, got ${layout.fpRows}`);
@@ -926,8 +905,7 @@ async function runTests() {
       autoLogin: { firstName: 'Test', lastName: 'User', password: 'pass' },
     });
 
-    await app.start();
-    await sleep(50);
+    await startAndLogin(app);
 
     const plain = buf.getPlainText();
     assert(plain.includes('·'), 'FOV arc dots should appear around self');
@@ -944,8 +922,7 @@ async function runTests() {
       autoLogin: { firstName: 'Test', lastName: 'User', password: 'pass' },
     });
 
-    await app.start();
-    await sleep(50);
+    await startAndLogin(app);
 
     const plain = buf.getPlainText();
     // Other avatar at yaw=1.57 (north) should render as '^'
@@ -965,8 +942,7 @@ async function runTests() {
       autoLogin: { firstName: 'Test', lastName: 'User', password: 'pass' },
     });
 
-    await app.start();
-    await sleep(50);
+    await startAndLogin(app);
 
     bridge.simulateDisconnect('Server shutdown');
     const lines = app.getChatBuffer().getVisibleLines(10);
@@ -984,8 +960,7 @@ async function runTests() {
       autoLogin: { firstName: 'Test', lastName: 'User', password: 'pass' },
     });
 
-    await app.start();
-    await sleep(50);
+    await startAndLogin(app);
 
     bridge.simulateFriendRequest('Alice', 'Be my friend!');
     const lines = app.getChatBuffer().getVisibleLines(10);
@@ -1003,8 +978,7 @@ async function runTests() {
       autoLogin: { firstName: 'Test', lastName: 'User', password: 'pass' },
     });
 
-    await app.start();
-    await sleep(50);
+    await startAndLogin(app);
 
     bridge.simulateTeleportOffer('Bob', 'Join me!');
     const lines = app.getChatBuffer().getVisibleLines(10);
@@ -1024,8 +998,7 @@ async function runTests() {
       autoLogin: { firstName: 'Test', lastName: 'User', password: 'pass' },
     });
 
-    await app.start();
-    await sleep(50);
+    await startAndLogin(app);
 
     bridge.failNextTeleport(new Error('Region not found'));
 
@@ -1053,8 +1026,7 @@ async function runTests() {
       autoLogin: { firstName: 'Test', lastName: 'User', password: 'pass' },
     });
 
-    await app.start();
-    await sleep(50);
+    await startAndLogin(app);
 
     assert(app.isRunning(), 'Should be running after start');
     assert(app.isTickActive(), 'Tick should be active after login');
@@ -1082,8 +1054,7 @@ async function runTests() {
       onLogout: () => { logoutCalled = true; },
     });
 
-    await app.start();
-    await sleep(50);
+    await startAndLogin(app);
 
     assertEqual(app.getMode(), 'grid');
     assert(app.isTickActive(), 'Tick should be active');
@@ -1119,8 +1090,7 @@ async function runTests() {
       onLoginSuccess: () => { loginCount++; },
     });
 
-    await app.start();
-    await sleep(50);
+    await startAndLogin(app);
     assertEqual(loginCount, 1, 'First login');
 
     // Logout
@@ -1164,8 +1134,7 @@ async function runTests() {
       onLoginSuccess: (fn, ln, pw) => { savedCreds = { fn, ln, pw }; },
     });
 
-    await app.start();
-    await sleep(50);
+    await startAndLogin(app);
 
     assert(savedCreds !== null, 'onLoginSuccess should have been called');
     assertEqual(savedCreds!.fn, 'Test');

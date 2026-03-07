@@ -68,6 +68,10 @@ export function renderLoginScreen(out: WritableTarget, state: LoginState): void 
   }
 
   // Hints
+  const hasSaved = state.firstName.length > 0 && state.password.length > 0;
+  if (hasSaved) {
+    buf += moveTo(startRow + 11, startCol + 2) + `${ESC}33m` + 'Saved credentials loaded. Press Enter to login.' + RESET;
+  }
   buf += moveTo(startRow + 12, startCol + 2) + DIM + 'Tab: next field  Enter: login  Ctrl+C: quit' + RESET;
 
   out.write(buf);
