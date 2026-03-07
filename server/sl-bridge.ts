@@ -322,13 +322,17 @@ export class SLBridge {
     }
   }
 
-  // Body yaw tracked locally for turning
-  private _bodyYaw = Math.PI / 2; // default facing north
+  // Body yaw tracked locally for turning, with smooth animation
+  private _bodyYaw = Math.PI / 2; // current display yaw
+  private _targetYaw = Math.PI / 2; // target yaw (snapped to 22.5° increments)
 
   // Movement — body-relative: forward/back/strafe relative to facing direction
   move(dir: string): void {
     if (!this.bot) return;
     const agent = this.bot.agent;
+
+    // Snap to target yaw immediately when moving so direction is correct
+    this._bodyYaw = this._targetYaw;
 
     // Clear previous movement
     agent.clearControlFlag(
@@ -365,25 +369,47 @@ export class SLBridge {
     agent.sendAgentUpdate();
   }
 
-  // Turn left/right by a fixed increment
+  // Turn left/right by a fixed increment — sets target, animation is in getBodyYaw()
   turn(direction: 'left' | 'right'): void {
     const TURN_STEP = Math.PI / 8; // 22.5 degrees per press
     if (direction === 'left') {
-      this._bodyYaw += TURN_STEP;
+      this._targetYaw += TURN_STEP;
     } else {
-      this._bodyYaw -= TURN_STEP;
+      this._targetYaw -= TURN_STEP;
     }
-    // Normalize to [-PI, PI]
-    while (this._bodyYaw > Math.PI) this._bodyYaw -= 2 * Math.PI;
-    while (this._bodyYaw < -Math.PI) this._bodyYaw += 2 * Math.PI;
+    // Normalize target to [-PI, PI]
+    while (this._targetYaw > Math.PI) this._targetYaw -= 2 * Math.PI;
+    while (this._targetYaw < -Math.PI) this._targetYaw += 2 * Math.PI;
+  }
 
+  // Returns smoothly interpolated yaw, advancing toward _targetYaw each call
+  getBodyYaw(): number {
+    if (this._bodyYaw === this._targetYaw) return this._bodyYaw;
+
+    // Compute shortest angular distance
+    let diff = this._targetYaw - this._bodyYaw;
+    while (diff > Math.PI) diff -= 2 * Math.PI;
+    while (diff < -Math.PI) diff += 2 * Math.PI;
+
+    // Lerp: cover ~15% of remaining distance per frame (at 15Hz = smooth over ~10-15 frames)
+    const LERP_SPEED = 0.15;
+    const SNAP_THRESHOLD = 0.005; // ~0.3 degrees
+
+    if (Math.abs(diff) < SNAP_THRESHOLD) {
+      this._bodyYaw = this._targetYaw;
+    } else {
+      this._bodyYaw += diff * LERP_SPEED;
+      // Normalize
+      while (this._bodyYaw > Math.PI) this._bodyYaw -= 2 * Math.PI;
+      while (this._bodyYaw < -Math.PI) this._bodyYaw += 2 * Math.PI;
+    }
+
+    // Update SL agent rotation to match current display yaw
     this.applyBodyYaw();
     if (this.bot) {
       this.bot.agent.sendAgentUpdate();
     }
-  }
 
-  getBodyYaw(): number {
     return this._bodyYaw;
   }
 
