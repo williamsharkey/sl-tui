@@ -311,7 +311,7 @@ console.log('\n=== InputHandler ===');
 // Helper for InputHandler callbacks
 function makeCallbacks(overrides: Partial<import('../tui/input.js').InputCallbacks> = {}): import('../tui/input.js').InputCallbacks {
   return {
-    onMove: () => {}, onStop: () => {}, onToggleFly: () => {},
+    onMove: () => {}, onStop: () => {}, onToggleFly: () => {}, onToggleDither: () => {},
     onTurnLeft: () => {}, onTurnRight: () => {},
     onEnterChat: () => {}, onExitChat: () => {},
     onChatSubmit: () => {}, onChatChar: () => {}, onChatBackspace: () => {},

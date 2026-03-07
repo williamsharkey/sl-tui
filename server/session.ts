@@ -254,6 +254,7 @@ export class Session {
       selfZ: pos.z,
       waterHeight: this.bridge.getWaterHeight(),
       metersPerCell: this.metersPerCell,
+      yaw: this.bridge.getBodyYaw(),
     };
 
     const frame = projectFrame(
@@ -287,6 +288,7 @@ export class Session {
       selfZ: pos.z,
       waterHeight,
       metersPerCell: this.metersPerCell,
+      yaw: this.bridge.getBodyYaw(),
     };
 
     const frame = projectFrame(

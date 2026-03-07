@@ -274,7 +274,7 @@ export function renderInputLine(
   if (mode === 'chat-input') {
     content = `Say: ${inputText}\u2588`;
   } else if (mode === 'grid') {
-    content = ' W/S:fwd/back A/D:strafe \u2190\u2192:turn Space:jump F:fly Enter:chat Q:quit';
+    content = ' W/S:fwd/back A/D:strafe \u2190\u2192:turn Space:jump F:fly V:dither Enter:chat Q:quit';
   } else {
     content = '';
   }

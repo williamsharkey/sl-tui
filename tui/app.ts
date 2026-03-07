@@ -45,6 +45,8 @@ export class TUIApp {
   private regionName = '';
   private loginPending = false;
   private lastStatusStr = '';
+  private ditherEnabled = false;
+  private ditherPhase = 0;
   private autoLogin?: { firstName: string; lastName: string; password: string };
   private createBridge?: () => ISLBridge;
   private onLoginSuccess?: (firstName: string, lastName: string, password: string) => void;
@@ -66,6 +68,12 @@ export class TUIApp {
       onStop: () => this.bridge.stop(),
       onTurnLeft: () => this.bridge.turn('left'),
       onTurnRight: () => this.bridge.turn('right'),
+      onToggleDither: () => {
+        this.ditherEnabled = !this.ditherEnabled;
+        if (!this.ditherEnabled) this.ditherPhase = 0;
+        this.chatBuffer.addSystem(`Dither ${this.ditherEnabled ? 'ON' : 'OFF'}`);
+        this.renderChat();
+      },
       onToggleFly: () => {
         this.bridge.setFlying(!this.bridge.flying);
         this.renderStatus();
@@ -226,13 +234,19 @@ export class TUIApp {
     // Accumulate all output into a single buffer
     let buf = '';
 
+    // Advance dither phase
+    if (this.ditherEnabled) {
+      this.ditherPhase += 0.15; // smooth flow speed
+    }
+
     // Main view: first-person perspective (full width, full FP area)
     if (this.layout.fpRows > 0) {
       const fpFrame = projectFirstPerson(
         terrainFn,
         avatars,
         objects,
-        { selfX: pos.x, selfY: pos.y, selfZ: pos.z, yaw: selfYaw, waterHeight },
+        { selfX: pos.x, selfY: pos.y, selfZ: pos.z, yaw: selfYaw, waterHeight,
+          ditherPhase: this.ditherEnabled ? this.ditherPhase : undefined },
         this.layout.fpCols,
         this.layout.fpRows,
       );
@@ -263,6 +277,7 @@ export class TUIApp {
         selfZ: pos.z,
         waterHeight,
         metersPerCell: 256 / this.layout.minimapCols,
+        yaw: selfYaw, // rotate minimap so up = facing direction
       },
       this.bridge.flying,
     );

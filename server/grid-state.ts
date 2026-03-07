@@ -113,22 +113,7 @@ export interface ProjectionParams {
   selfZ: number;
   waterHeight: number;
   metersPerCell: number;
-}
-
-// Convert sim coords to grid coords, centered on self
-function simToGrid(
-  simX: number, simY: number,
-  params: ProjectionParams
-): { col: number; row: number } | null {
-  const halfCols = params.cols / 2;
-  const halfRows = params.rows / 2;
-  const dx = simX - params.selfX;
-  const dy = simY - params.selfY;
-  const col = Math.round(halfCols + dx / params.metersPerCell);
-  // Y is inverted: north (higher Y) = lower row index (top of screen)
-  const row = Math.round(halfRows - dy / params.metersPerCell);
-  if (col < 0 || col >= params.cols || row < 0 || row >= params.rows) return null;
-  return { col, row };
+  yaw?: number; // facing direction — rotates the map so up = facing
 }
 
 // FOV arc: draw dots at radius 2-3 cells around self within a ~90° cone
@@ -176,6 +161,48 @@ function renderFovArc(
   }
 }
 
+// Rotated sim-to-grid: applies yaw rotation so "up" on screen = facing direction
+function simToGridRotated(
+  simX: number, simY: number,
+  params: ProjectionParams,
+  cosY: number, sinY: number,
+): { col: number; row: number } | null {
+  const dx = simX - params.selfX;
+  const dy = simY - params.selfY;
+  // Rotate by -yaw so facing direction maps to screen-up
+  const rx = dx * cosY + dy * sinY;
+  const ry = -dx * sinY + dy * cosY;
+  const col = Math.round(params.cols / 2 + rx / params.metersPerCell);
+  const row = Math.round(params.rows / 2 - ry / params.metersPerCell);
+  if (col < 0 || col >= params.cols || row < 0 || row >= params.rows) return null;
+  return { col, row };
+}
+
+// Place a compass label at the edge of the map for a given world direction
+function placeCompassLabel(
+  frame: GridFrame, cols: number, rows: number,
+  label: string, worldAngle: number, // radians, SL convention: 0=east, pi/2=north
+  cosY: number, sinY: number,
+): void {
+  // Direction in rotated screen space
+  const dx = Math.cos(worldAngle);
+  const dy = Math.sin(worldAngle);
+  const rx = dx * cosY + dy * sinY;
+  const ry = -dx * sinY + dy * cosY;
+  // Project to edge: find where ray hits border
+  const halfC = cols / 2 - 1;
+  const halfR = rows / 2 - 1;
+  let t = Infinity;
+  if (rx !== 0) t = Math.min(t, Math.abs(halfC / rx));
+  if (ry !== 0) t = Math.min(t, Math.abs(halfR / ry));
+  const ec = Math.round(cols / 2 + rx * t);
+  const er = Math.round(rows / 2 - ry * t);
+  const c = Math.max(0, Math.min(cols - 1, ec));
+  const r = Math.max(0, Math.min(rows - 1, er));
+  const idx = r * cols + c;
+  frame.cells[idx] = { char: label, fg: '#ffffff', bg: BG };
+}
+
 export function projectFrame(
   terrain: (x: number, y: number) => number,
   avatars: AvatarData[],
@@ -186,11 +213,20 @@ export function projectFrame(
   const { cols, rows, selfX, selfY, selfZ, waterHeight, metersPerCell } = params;
   const frame = createEmptyFrame(cols, rows);
 
-  // 1. Terrain layer
+  // Rotation for yaw-oriented map (up = facing direction)
+  const yaw = params.yaw ?? Math.PI / 2; // default: north up
+  const cosY = Math.cos(yaw);
+  const sinY = Math.sin(yaw);
+
+  // 1. Terrain layer — sample in rotated screen space
   for (let row = 0; row < rows; row++) {
     for (let col = 0; col < cols; col++) {
-      const simX = selfX + (col - cols / 2) * metersPerCell;
-      const simY = selfY + (rows / 2 - row) * metersPerCell;
+      // Screen offset from center
+      const sx = (col - cols / 2) * metersPerCell;
+      const sy = (rows / 2 - row) * metersPerCell;
+      // Inverse-rotate back to world coords
+      const simX = selfX + sx * cosY - sy * sinY;
+      const simY = selfY + sx * sinY + sy * cosY;
       if (simX >= 0 && simX < 256 && simY >= 0 && simY < 256) {
         const h = terrain(Math.floor(simX), Math.floor(simY));
         frame.cells[row * cols + col] = terrainCell(h, waterHeight);
@@ -207,7 +243,7 @@ export function projectFrame(
     const maxDim = Math.max(obj.scaleX, obj.scaleY, obj.scaleZ);
     if (maxDim < 0.5) continue;
 
-    const pos = simToGrid(obj.x, obj.y, params);
+    const pos = simToGridRotated(obj.x, obj.y, params, cosY, sinY);
     if (!pos) continue;
 
     let fg = obj.isTree ? COLORS.tree : COLORS.object;
@@ -226,7 +262,7 @@ export function projectFrame(
     const dz = Math.abs(av.z - selfZ);
     if (dz >= 30) continue;
 
-    const pos = simToGrid(av.x, av.y, params);
+    const pos = simToGridRotated(av.x, av.y, params, cosY, sinY);
     if (!pos) continue;
 
     const ch = yawToDirectionChar(av.yaw);
@@ -240,10 +276,9 @@ export function projectFrame(
 
   // 4. Flying shadow
   if (flying && selfZ > waterHeight + 5) {
-    const selfGrid = simToGrid(selfX, selfY, params);
+    const selfGrid = simToGridRotated(selfX, selfY, params, cosY, sinY);
     if (selfGrid) {
       const idx = selfGrid.row * cols + selfGrid.col;
-      // Only place shadow if self won't overwrite it (self always at center anyway)
       frame.cells[idx] = { char: '+', fg: COLORS.shadow, bg: BG };
     }
   }
@@ -256,26 +291,34 @@ export function projectFrame(
     frame.cells[idx] = { char: '@', fg: COLORS.self, bg: BG };
   }
 
-  // 5b. FOV arc — show facing direction around self
-  const selfAv = avatars.find(a => a.isSelf);
-  if (selfAv && selfCol >= 0 && selfCol < cols && selfRow >= 0 && selfRow < rows) {
-    renderFovArc(frame, selfCol, selfRow, selfAv.yaw, cols, rows);
+  // 5b. FOV arc — in rotated map, facing is always screen-up
+  if (selfCol >= 0 && selfCol < cols && selfRow >= 0 && selfRow < rows) {
+    renderFovArc(frame, selfCol, selfRow, Math.PI / 2, cols, rows); // always up
   }
 
-  // 6. Edge indicators for off-screen avatars
+  // 6. Compass labels on edges: N E S W
+  placeCompassLabel(frame, cols, rows, 'N', Math.PI / 2, cosY, sinY);   // north
+  placeCompassLabel(frame, cols, rows, 'E', 0, cosY, sinY);             // east
+  placeCompassLabel(frame, cols, rows, 'S', -Math.PI / 2, cosY, sinY);  // south
+  placeCompassLabel(frame, cols, rows, 'W', Math.PI, cosY, sinY);       // west
+
+  // 7. Edge indicators for off-screen avatars
   for (const av of avatars) {
     if (av.isSelf) continue;
     const dz = Math.abs(av.z - selfZ);
     if (dz >= 30) continue;
-    const pos = simToGrid(av.x, av.y, params);
+    const pos = simToGridRotated(av.x, av.y, params, cosY, sinY);
     if (pos) continue; // on-screen
 
     const dx = av.x - selfX;
     const dy = av.y - selfY;
-    let edgeCol: number, edgeRow: number, arrow: string;
-    const angle = Math.atan2(dy, dx);
+    // Rotate into screen space
+    const rx = dx * cosY + dy * sinY;
+    const ry = -dx * sinY + dy * cosY;
+    const angle = Math.atan2(ry, rx);
     const deg = ((angle * 180 / Math.PI) + 360) % 360;
 
+    let edgeCol: number, edgeRow: number, arrow: string;
     if (deg >= 315 || deg < 45) { edgeCol = cols - 1; edgeRow = Math.round(rows / 2); arrow = '>'; }
     else if (deg >= 45 && deg < 135) { edgeCol = Math.round(cols / 2); edgeRow = 0; arrow = '^'; }
     else if (deg >= 135 && deg < 225) { edgeCol = 0; edgeRow = Math.round(rows / 2); arrow = '<'; }
@@ -337,6 +380,7 @@ export interface FirstPersonParams {
   selfZ: number;  // eye height
   yaw: number;
   waterHeight: number;
+  ditherPhase?: number; // 0 = off, >0 = animated phase for spatial dither
 }
 
 // Stick figure: scales with perspective distance
@@ -399,6 +443,19 @@ function renderStickFigure(
   }
 }
 
+// Cheap spatial hash noise for dither — blobby, flowing, spatially coherent
+function ditherNoise(x: number, y: number, phase: number): [number, number] {
+  // Two octaves of sin-based spatial noise, phase-shifted for flow
+  const s1 = Math.sin(x * 0.7 + phase * 1.3) * Math.cos(y * 0.9 + phase * 0.7);
+  const s2 = Math.sin(y * 0.6 - phase * 1.1) * Math.cos(x * 0.8 - phase * 0.9);
+  const s3 = Math.sin((x + y) * 0.4 + phase * 2.1) * 0.5;
+  const s4 = Math.cos((x - y) * 0.5 + phase * 1.7) * 0.5;
+  return [
+    (s1 + s3) * 1.2, // dx offset in meters
+    (s2 + s4) * 1.2, // dy offset in meters
+  ];
+}
+
 export function projectFirstPerson(
   terrain: (x: number, y: number) => number,
   avatars: AvatarData[],
@@ -407,8 +464,9 @@ export function projectFirstPerson(
   cols: number,
   rows: number,
 ): GridFrame {
-  const { selfX, selfY, selfZ, yaw, waterHeight } = params;
+  const { selfX, selfY, selfZ, yaw, waterHeight, ditherPhase } = params;
   const frame = createEmptyFrame(cols, rows);
+  const dither = ditherPhase !== undefined && ditherPhase > 0;
 
   // Fill with sky
   const skyFg = SKY_COLORS[0];
@@ -439,8 +497,16 @@ export function projectFirstPerson(
       if (topDrawn[col] <= 0) continue; // fully occluded
 
       const lateralOffset = (col - cols / 2) * LATERAL_SCALE;
-      const wx = selfX + fwdX * depth + rightX * lateralOffset;
-      const wy = selfY + fwdY * depth + rightY * lateralOffset;
+      let wx = selfX + fwdX * depth + rightX * lateralOffset;
+      let wy = selfY + fwdY * depth + rightY * lateralOffset;
+
+      // Apply spatial dither: flowing noise offsets scaled by depth
+      if (dither) {
+        const scale = Math.min(1, depth / 20); // stronger at distance
+        const [dx, dy] = ditherNoise(wx * 0.15, wy * 0.15, ditherPhase!);
+        wx += dx * scale;
+        wy += dy * scale;
+      }
 
       // Out of region
       if (wx < 0 || wx >= 256 || wy < 0 || wy >= 256) continue;

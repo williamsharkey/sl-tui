@@ -9,6 +9,7 @@ export interface InputCallbacks {
   onMove: (dir: string) => void;
   onStop: () => void;
   onToggleFly: () => void;
+  onToggleDither: () => void;
   onTurnLeft: () => void;
   onTurnRight: () => void;
   onEnterChat: () => void;
@@ -127,6 +128,8 @@ export class InputHandler {
       this.scheduleStop();
     } else if (str === 'f' || str === 'F') {
       this.callbacks.onToggleFly();
+    } else if (str === 'v' || str === 'V') {
+      this.callbacks.onToggleDither();
     } else if (key.name === 'return') {
       this.callbacks.onEnterChat();
     } else if (str === 'q' || str === 'Q') {
