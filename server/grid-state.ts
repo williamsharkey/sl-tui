@@ -508,65 +508,91 @@ export function projectFirstPerson(
   const buf = getFPPixelBuffer(pw, ph);
   clearFPPixelBuffer(buf);
 
-  const horizonPy = Math.floor(ph / 2);
+  // ─── Comanche-style voxel space raycasting ───────────────────────
+  // Each pixel column casts a ray from the camera through the view
+  // frustum with proper perspective fan-out. Rays march front-to-back,
+  // projecting terrain height via perspective division, and fill
+  // vertical spans with depth-fogged terrain color.
+
   const fwdX = Math.cos(yaw);
   const fwdY = Math.sin(yaw);
   const rightX = Math.sin(yaw);
   const rightY = -Math.cos(yaw);
 
   const MAX_DEPTH = 96;
-  const DEPTH_STEPS = 64; // more steps for smoother terrain at 2x
-  const DEPTH_STEP = MAX_DEPTH / DEPTH_STEPS;
-  const LATERAL_SCALE = 1.5 / 2; // meters per pixel-column (half of cell scale)
-  const VSCALE = horizonPy > 0 ? horizonPy : 1;
+  const FOV = Math.PI / 3;           // 60° horizontal FOV
+  const HALF_FOV = FOV / 2;
+  const NEAR = 1;
+  const CAMERA_HEIGHT = selfZ;       // eye height in world
+  const PITCH = 0;                   // look straight ahead (radians, + = up)
+  const HORIZON = Math.floor(ph / 2) - Math.round(PITCH * ph / FOV);
 
-  // Per-pixel-column occlusion
+  // Per-pixel-column occlusion: highest (lowest py) drawn so far
   const topDrawn = new Int32Array(pw).fill(ph);
 
-  // Front-to-back terrain strips
-  for (let di = 0; di < DEPTH_STEPS; di++) {
-    const depth = (di + 1) * DEPTH_STEP;
+  // Cast one ray per pixel column
+  for (let pcol = 0; pcol < pw; pcol++) {
+    // Ray angle: fan out from -HALF_FOV to +HALF_FOV across the screen
+    const screenX = (pcol / pw) * 2 - 1;  // -1 to +1
+    const rayAngle = yaw + Math.atan(screenX * Math.tan(HALF_FOV));
+    const rayDirX = Math.cos(rayAngle);
+    const rayDirY = Math.sin(rayAngle);
 
-    for (let pcol = 0; pcol < pw; pcol++) {
-      if (topDrawn[pcol] <= 0) continue;
+    // Cosine correction to prevent fisheye distortion
+    const cosCorrection = Math.cos(rayAngle - yaw);
 
-      const lateralOffset = (pcol - pw / 2) * LATERAL_SCALE;
-      let wx = selfX + fwdX * depth + rightX * lateralOffset;
-      let wy = selfY + fwdY * depth + rightY * lateralOffset;
+    // March along the ray front-to-back with adaptive step size
+    let depth = NEAR;
+    let stepSize = 0.5;
 
+    while (depth < MAX_DEPTH && topDrawn[pcol] > 0) {
+      const wx = selfX + rayDirX * depth;
+      const wy = selfY + rayDirY * depth;
+
+      // Apply dither noise at distance
+      let sampleX = wx, sampleY = wy;
       if (dither) {
         const scale = Math.min(1, depth / 20);
         const [ddx, ddy] = ditherNoise(wx * 0.15, wy * 0.15, ditherPhase!);
-        wx += ddx * scale;
-        wy += ddy * scale;
+        sampleX += ddx * scale;
+        sampleY += ddy * scale;
       }
 
-      if (wx < 0 || wx >= 256 || wy < 0 || wy >= 256) continue;
+      if (sampleX >= 0 && sampleX < 256 && sampleY >= 0 && sampleY < 256) {
+        const h = terrain(Math.floor(sampleX), Math.floor(sampleY));
 
-      const h = terrain(Math.floor(wx), Math.floor(wy));
-      const heightDiff = h - selfZ;
-      const screenPy = Math.round(horizonPy - (heightDiff / depth) * VSCALE);
+        // Perspective project: screen Y from height difference and corrected depth
+        const correctedDepth = depth * cosCorrection;
+        const heightOnScreen = ((CAMERA_HEIGHT - h) / correctedDepth) * ph;
+        const screenPy = Math.round(HORIZON + heightOnScreen);
 
-      if (screenPy >= topDrawn[pcol]) continue;
+        if (screenPy < topDrawn[pcol]) {
+          const drawFrom = Math.max(0, screenPy);
+          const drawTo = topDrawn[pcol];
 
-      const drawFrom = Math.max(0, screenPy);
-      const drawTo = topDrawn[pcol];
+          let [tr, tg, tb] = (h < waterHeight)
+            ? waterPixelRGB(h, waterHeight, sampleX, sampleY, depth)
+            : terrainRGB(h, waterHeight);
+          [tr, tg, tb] = fogRGB(tr, tg, tb, depth, MAX_DEPTH);
 
-      // Get terrain color and apply fog
-      let [tr, tg, tb] = (h < waterHeight)
-        ? waterPixelRGB(h, waterHeight, wx, wy, depth)
-        : terrainRGB(h, waterHeight);
-      [tr, tg, tb] = fogRGB(tr, tg, tb, depth, MAX_DEPTH);
+          for (let py = drawFrom; py < drawTo; py++) {
+            setFPPixel(buf, pcol, py, tr, tg, tb);
+          }
 
-      for (let py = drawFrom; py < drawTo; py++) {
-        setFPPixel(buf, pcol, py, tr, tg, tb);
+          topDrawn[pcol] = drawFrom;
+        }
       }
 
-      topDrawn[pcol] = drawFrom;
+      // Adaptive step: smaller steps close, larger far away
+      depth += stepSize;
+      if (depth > 8) stepSize = 1;
+      if (depth > 30) stepSize = 2;
+      if (depth > 60) stepSize = 3;
     }
   }
 
-  // Horizon line
+  // Horizon line through remaining sky columns
+  const horizonPy = HORIZON;
   if (horizonPy >= 0 && horizonPy < ph) {
     for (let pcol = 0; pcol < pw; pcol++) {
       if (topDrawn[pcol] > horizonPy) {
@@ -575,27 +601,39 @@ export function projectFirstPerson(
     }
   }
 
-  // Objects (rendered as pixel rectangles)
-  for (const obj of objects) {
-    const dx = obj.x - selfX;
-    const dy = obj.y - selfY;
+  // ─── Project world position to screen pixel coords ────────────
+  // Shared projection for objects and avatars
+  function worldToScreen(wx: number, wy: number, wz: number): { px: number; py: number; dist: number } | null {
+    const dx = wx - selfX;
+    const dy = wy - selfY;
     const forwardDist = dx * fwdX + dy * fwdY;
-    if (forwardDist < 2 || forwardDist > MAX_DEPTH) continue;
+    if (forwardDist < NEAR || forwardDist > MAX_DEPTH) return null;
 
     const lateralDist = dx * rightX + dy * rightY;
-    const screenPx = Math.round(pw / 2 + lateralDist / LATERAL_SCALE);
-    if (screenPx < 0 || screenPx >= pw) continue;
+    // Perspective projection: screen X from lateral/forward ratio
+    const screenX = (lateralDist / forwardDist) / Math.tan(HALF_FOV);
+    const px = Math.round((screenX + 1) * 0.5 * pw);
+    if (px < 0 || px >= pw) return null;
 
-    const heightDiff = (obj.z + obj.scaleZ / 2) - selfZ;
-    const screenPy = Math.round(horizonPy - (heightDiff / forwardDist) * VSCALE);
+    const heightOnScreen = ((CAMERA_HEIGHT - wz) / forwardDist) * ph;
+    const py = Math.round(HORIZON + heightOnScreen);
+
+    return { px, py, dist: forwardDist };
+  }
+
+  // Objects (rendered as pixel rectangles with perspective sizing)
+  for (const obj of objects) {
+    const proj = worldToScreen(obj.x, obj.y, obj.z + obj.scaleZ / 2);
+    if (!proj) continue;
+    const { px: screenPx, py: screenPy, dist: forwardDist } = proj;
     if (screenPy < 0 || screenPy >= ph) continue;
     if (screenPy >= topDrawn[Math.max(0, Math.min(pw - 1, screenPx))]) continue;
 
     const baseRGB: [number, number, number] = obj.isTree ? [0x33, 0x66, 0x33] : [0x88, 0x55, 0x22];
-    let [or, og, ob] = fogRGB(baseRGB[0], baseRGB[1], baseRGB[2], forwardDist, MAX_DEPTH);
+    const [or, og, ob] = fogRGB(baseRGB[0], baseRGB[1], baseRGB[2], forwardDist, MAX_DEPTH);
 
-    const entityPxH = Math.max(2, Math.round((obj.scaleZ || 2) / forwardDist * VSCALE));
-    const entityPxW = Math.max(2, Math.round((Math.max(obj.scaleX, obj.scaleY) || 1) / forwardDist * VSCALE));
+    const entityPxH = Math.max(2, Math.round((obj.scaleZ || 2) / forwardDist * ph));
+    const entityPxW = Math.max(2, Math.round((Math.max(obj.scaleX, obj.scaleY) || 1) / forwardDist * ph));
     const startPy = Math.max(0, screenPy - entityPxH + 1);
     const startPx = screenPx - Math.floor(entityPxW / 2);
 
@@ -612,19 +650,15 @@ export function projectFirstPerson(
   const meshLookup = params.meshLookup;
   for (const av of avatars) {
     if (av.isSelf) continue;
-    const dx = av.x - selfX;
-    const dy = av.y - selfY;
-    const forwardDist = dx * fwdX + dy * fwdY;
-    if (forwardDist < 2 || forwardDist > MAX_DEPTH) continue;
 
-    const lateralDist = dx * rightX + dy * rightY;
-    const screenPx = Math.round(pw / 2 + lateralDist / LATERAL_SCALE);
-    if (screenPx < 0 || screenPx >= pw) continue;
+    const headProj = worldToScreen(av.x, av.y, av.z + 2);
+    const feetProj = worldToScreen(av.x, av.y, av.z);
+    if (!headProj && !feetProj) continue;
 
-    const feetZ = av.z;
-    const headZ = av.z + 2;
-    const feetPy = Math.round(horizonPy - ((feetZ - selfZ) / forwardDist) * VSCALE);
-    const headPy = Math.round(horizonPy - ((headZ - selfZ) / forwardDist) * VSCALE);
+    const forwardDist = (headProj?.dist ?? feetProj!.dist);
+    const screenPx = (headProj?.px ?? feetProj!.px);
+    const headPy = headProj ? headProj.py : 0;
+    const feetPy = feetProj ? feetProj.py : ph - 1;
     if (headPy >= ph || feetPy < 0) continue;
 
     const figH = Math.max(1, feetPy - headPy + 1);
