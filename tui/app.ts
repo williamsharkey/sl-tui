@@ -1,7 +1,7 @@
 // app.ts — TUIApp: owns bridge, tick loop, screen state
 
 import type { ISLBridge, WritableTarget } from './types.js';
-import type { GridFrame, ChatBubble } from '../server/grid-state.js';
+import type { GridFrame, ChatBubble, RenderMode } from '../server/grid-state.js';
 import { projectFrame, projectFirstPerson, diffFrames } from '../server/grid-state.js';
 import { computeLayout, type ScreenLayout } from './screen.js';
 import {
@@ -48,6 +48,7 @@ export class TUIApp {
   private lastStatusStr = '';
   private ditherEnabled = false;
   private ditherPhase = 0;
+  private renderMode: RenderMode = 'voxel';
   private chatBubbles = new Map<string, ChatBubble>();
   private menu: MenuPanel;
   private autoLogin?: { firstName: string; lastName: string; password: string };
@@ -105,6 +106,12 @@ export class TUIApp {
         this.ditherEnabled = !this.ditherEnabled;
         if (!this.ditherEnabled) this.ditherPhase = 0;
         this.chatBuffer.addSystem(`Dither ${this.ditherEnabled ? 'ON' : 'OFF'}`);
+        this.renderChat();
+      },
+      onToggleRenderMode: () => {
+        this.renderMode = this.renderMode === 'voxel' ? 'triangle' : 'voxel';
+        this.prevFpFrame = null; // force full redraw
+        this.chatBuffer.addSystem(`Render: ${this.renderMode}`);
         this.renderChat();
       },
       onToggleFly: () => {
@@ -328,7 +335,8 @@ export class TUIApp {
           meshLookup: (uuid: string) => this.bridge.getAvatarMeshBundle(uuid),
           avatarNames: avatarNameMap,
           chatBubbles: this.chatBubbles,
-          skyColors: this.bridge.getSkyColors() ?? undefined },
+          skyColors: this.bridge.getSkyColors() ?? undefined,
+          renderMode: this.renderMode },
         this.layout.fpCols,
         this.layout.fpRows,
       );

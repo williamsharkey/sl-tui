@@ -4,6 +4,7 @@ import type { AvatarMeshBundle } from './avatar-cache.js';
 import {
   createRasterTarget, clearRasterTarget, rasterize,
   mat4Multiply, mat4LookAt, mat4Perspective, mat4ModelPosScale,
+  mat4ModelPosScaleRot,
 } from './soft-rasterizer.js';
 import { pixelsToCells } from './pixel-to-cells.js';
 
@@ -98,6 +99,9 @@ export interface AvatarData {
   z: number;
   yaw: number; // radians
   isSelf: boolean;
+  velX: number;
+  velY: number;
+  velZ: number;
 }
 
 export interface ObjectData {
@@ -110,6 +114,12 @@ export interface ObjectData {
   scaleY: number;
   scaleZ: number;
   isTree: boolean;
+  pcode: number;        // 9=Prim, 95=Grass, 111=NewTree, 255=Tree
+  treeSpecies: number;  // -1 if not tree
+  pathCurve: number;    // 16=line(box), 32=circle(cyl/sphere)
+  profileCurve: number; // 0=circle, 1=square, 2=triangle, 5=halfCircle
+  rotX: number; rotY: number; rotZ: number; rotW: number;
+  colorR: number; colorG: number; colorB: number; // 0-255
 }
 
 export interface ProjectionParams {
@@ -281,8 +291,23 @@ export function projectFrame(
     const pos = simToGridRotated(obj.x, obj.y, params, cosY, sinY);
     if (!pos) continue;
 
-    let fg = obj.isTree ? COLORS.tree : COLORS.object;
-    const ch = obj.isTree ? 'T' : '#';
+    // Species-aware minimap char and use actual object color
+    let ch: string;
+    let fg: string;
+    if (obj.pcode === 95) {
+      ch = ','; // grass
+    } else if (obj.isTree) {
+      const sp = obj.treeSpecies;
+      if (sp === 0 || sp === 7 || sp === 8 || sp === 9 || sp === 11 || sp === 13) ch = 'Y'; // pine
+      else if (sp === 3 || sp === 6) ch = 'T'; // palm
+      else if (sp === 1 || sp === 10) ch = '@'; // oak
+      else ch = 'T';
+    } else {
+      ch = '#';
+    }
+    // Use actual color as fg hex
+    fg = `#${obj.colorR.toString(16).padStart(2,'0')}${obj.colorG.toString(16).padStart(2,'0')}${obj.colorB.toString(16).padStart(2,'0')}`;
+    if (obj.isTree && obj.colorR === 128 && obj.colorG === 128 && obj.colorB === 128) fg = COLORS.tree;
 
     if (dz >= 10) fg = COLORS.faint;
     else if (dz >= 3) fg = COLORS.dimmed;
@@ -551,6 +576,8 @@ export interface ChatBubble {
   ts: number; // timestamp when said
 }
 
+export type RenderMode = 'voxel' | 'triangle';
+
 export interface FirstPersonParams {
   selfX: number;
   selfY: number;
@@ -562,6 +589,7 @@ export interface FirstPersonParams {
   avatarNames?: Map<string, string>; // uuid → display name
   chatBubbles?: Map<string, ChatBubble>; // uuid → most recent chat
   skyColors?: { zenith: [number, number, number]; horizon: [number, number, number] };
+  renderMode?: RenderMode; // 'voxel' (default) or 'triangle'
 }
 
 // Shared raster target for avatar mesh rendering — reused across frames
@@ -589,6 +617,481 @@ function ditherNoise(x: number, y: number, phase: number): [number, number] {
   ];
 }
 
+// ─── Unit geometry generators (cached) ────────────────────────────
+interface UnitGeometry {
+  positions: Float32Array;
+  indices: Uint16Array;
+}
+
+// Geometry cache
+const _geoCache = new Map<string, UnitGeometry>();
+
+function cachedGeo(key: string, build: () => UnitGeometry): UnitGeometry {
+  let g = _geoCache.get(key);
+  if (!g) { g = build(); _geoCache.set(key, g); }
+  return g;
+}
+
+function getBoxGeometry(): UnitGeometry {
+  return cachedGeo('box', () => {
+    const p = new Float32Array([
+      -0.5,-0.5,-0.5,  0.5,-0.5,-0.5,  0.5,0.5,-0.5,  -0.5,0.5,-0.5, // bottom
+      -0.5,-0.5, 0.5,  0.5,-0.5, 0.5,  0.5,0.5, 0.5,  -0.5,0.5, 0.5, // top
+    ]);
+    const i = new Uint16Array([
+      0,1,2, 0,2,3, // bottom
+      4,6,5, 4,7,6, // top
+      0,5,1, 0,4,5, // front
+      2,7,3, 2,6,7, // back
+      0,3,7, 0,7,4, // left
+      1,5,6, 1,6,2, // right
+    ]);
+    return { positions: p, indices: i };
+  });
+}
+
+function getCylinderGeometry(): UnitGeometry {
+  return cachedGeo('cyl', () => {
+    const segs = 12;
+    const verts: number[] = [];
+    const idx: number[] = [];
+    verts.push(0, 0, -0.5); // 0: bottom center
+    verts.push(0, 0, 0.5);  // 1: top center
+    for (let i = 0; i < segs; i++) {
+      const a = (i / segs) * Math.PI * 2;
+      verts.push(Math.cos(a) * 0.5, Math.sin(a) * 0.5, -0.5);
+    }
+    for (let i = 0; i < segs; i++) {
+      const a = (i / segs) * Math.PI * 2;
+      verts.push(Math.cos(a) * 0.5, Math.sin(a) * 0.5, 0.5);
+    }
+    const bBase = 2, tBase = 2 + segs;
+    for (let i = 0; i < segs; i++) {
+      const n = (i + 1) % segs;
+      idx.push(0, bBase + n, bBase + i); // bottom cap
+      idx.push(1, tBase + i, tBase + n); // top cap
+      idx.push(bBase + i, bBase + n, tBase + i);
+      idx.push(tBase + i, bBase + n, tBase + n);
+    }
+    return { positions: new Float32Array(verts), indices: new Uint16Array(idx) };
+  });
+}
+
+function getSphereGeometry(): UnitGeometry {
+  return cachedGeo('sphere', () => {
+    const stacks = 6, slices = 8;
+    const verts: number[] = [];
+    const idx: number[] = [];
+    for (let i = 0; i <= stacks; i++) {
+      const phi = (i / stacks) * Math.PI;
+      const sp = Math.sin(phi), cp = Math.cos(phi);
+      for (let j = 0; j <= slices; j++) {
+        const theta = (j / slices) * Math.PI * 2;
+        verts.push(sp * Math.cos(theta) * 0.5, sp * Math.sin(theta) * 0.5, cp * 0.5);
+      }
+    }
+    const w = slices + 1;
+    for (let i = 0; i < stacks; i++) {
+      for (let j = 0; j < slices; j++) {
+        const a = i * w + j, b = a + 1, c = a + w, d = c + 1;
+        idx.push(a, c, b);
+        idx.push(b, c, d);
+      }
+    }
+    return { positions: new Float32Array(verts), indices: new Uint16Array(idx) };
+  });
+}
+
+function getPrismGeometry(): UnitGeometry {
+  return cachedGeo('prism', () => {
+    // Isometric triangular prism
+    const h = 0.5, r = 0.5;
+    const verts: number[] = [];
+    for (let z = -1; z <= 1; z += 2) {
+      for (let i = 0; i < 3; i++) {
+        const a = (i / 3) * Math.PI * 2 - Math.PI / 2;
+        verts.push(Math.cos(a) * r, Math.sin(a) * r, z * h);
+      }
+    }
+    const idx = new Uint16Array([
+      0,2,1, 3,4,5, // caps
+      0,1,4, 0,4,3, // sides
+      1,2,5, 1,5,4,
+      2,0,3, 2,3,5,
+    ]);
+    return { positions: new Float32Array(verts), indices: idx };
+  });
+}
+
+// Right triangle prism (wedge) — right angle at vertex 0
+function getWedgeGeometry(): UnitGeometry {
+  return cachedGeo('wedge', () => {
+    const verts = new Float32Array([
+      // bottom face (z=-0.5): right triangle
+      -0.5, -0.5, -0.5,  // 0: right-angle vertex
+       0.5, -0.5, -0.5,  // 1
+      -0.5,  0.5, -0.5,  // 2
+      // top face (z=0.5)
+      -0.5, -0.5,  0.5,  // 3
+       0.5, -0.5,  0.5,  // 4
+      -0.5,  0.5,  0.5,  // 5
+    ]);
+    const idx = new Uint16Array([
+      0,2,1, 3,4,5,       // caps
+      0,1,4, 0,4,3,       // front
+      1,2,5, 1,5,4,       // hypotenuse
+      2,0,3, 2,3,5,       // left side
+    ]);
+    return { positions: verts, indices: idx };
+  });
+}
+
+// Cone (half-circle profile extruded linearly — tapers from circle base to point)
+function getConeGeometry(): UnitGeometry {
+  return cachedGeo('cone', () => {
+    const segs = 12;
+    const verts: number[] = [];
+    const idx: number[] = [];
+    // Apex at top
+    verts.push(0, 0, 0.5); // 0: apex
+    // Bottom center
+    verts.push(0, 0, -0.5); // 1: base center
+    // Bottom ring
+    for (let i = 0; i < segs; i++) {
+      const a = (i / segs) * Math.PI * 2;
+      verts.push(Math.cos(a) * 0.5, Math.sin(a) * 0.5, -0.5);
+    }
+    const bBase = 2;
+    for (let i = 0; i < segs; i++) {
+      const n = (i + 1) % segs;
+      idx.push(1, bBase + n, bBase + i); // base cap
+      idx.push(0, bBase + i, bBase + n); // side to apex
+    }
+    return { positions: new Float32Array(verts), indices: new Uint16Array(idx) };
+  });
+}
+
+// Torus (circle profile revolved around circle path)
+function getTorusGeometry(): UnitGeometry {
+  return cachedGeo('torus', () => {
+    const ringSegs = 12; // segments around the ring (path)
+    const tubeSegs = 8;  // segments around the tube (profile)
+    const R = 0.35;      // major radius (center of tube to center of torus)
+    const r = 0.15;      // minor radius (tube radius)
+    const verts: number[] = [];
+    const idx: number[] = [];
+
+    for (let i = 0; i <= ringSegs; i++) {
+      const u = (i / ringSegs) * Math.PI * 2;
+      const cu = Math.cos(u), su = Math.sin(u);
+      for (let j = 0; j <= tubeSegs; j++) {
+        const v = (j / tubeSegs) * Math.PI * 2;
+        const cv = Math.cos(v), sv = Math.sin(v);
+        verts.push(
+          (R + r * cv) * cu,
+          (R + r * cv) * su,
+          r * sv,
+        );
+      }
+    }
+    const w = tubeSegs + 1;
+    for (let i = 0; i < ringSegs; i++) {
+      for (let j = 0; j < tubeSegs; j++) {
+        const a = i * w + j, b = a + 1;
+        const c = a + w, d = c + 1;
+        idx.push(a, c, b);
+        idx.push(b, c, d);
+      }
+    }
+    return { positions: new Float32Array(verts), indices: new Uint16Array(idx) };
+  });
+}
+
+// Tube (square profile revolved around circle path)
+function getTubeGeometry(): UnitGeometry {
+  return cachedGeo('tube', () => {
+    const ringSegs = 12;
+    const R = 0.35;       // major radius
+    const halfW = 0.15;   // half-width of the square tube
+    const verts: number[] = [];
+    const idx: number[] = [];
+    // 4 corners of square profile at each ring segment
+    const profileOffsets = [
+      [-halfW, -halfW], [halfW, -halfW], [halfW, halfW], [-halfW, halfW],
+    ];
+    for (let i = 0; i <= ringSegs; i++) {
+      const u = (i / ringSegs) * Math.PI * 2;
+      const cu = Math.cos(u), su = Math.sin(u);
+      for (const [pr, pz] of profileOffsets) {
+        verts.push((R + pr) * cu, (R + pr) * su, pz);
+      }
+    }
+    const pn = profileOffsets.length; // 4 verts per ring
+    for (let i = 0; i < ringSegs; i++) {
+      const base = i * pn;
+      const next = base + pn;
+      for (let j = 0; j < pn; j++) {
+        const j2 = (j + 1) % pn;
+        idx.push(base + j, next + j, base + j2);
+        idx.push(base + j2, next + j, next + j2);
+      }
+    }
+    return { positions: new Float32Array(verts), indices: new Uint16Array(idx) };
+  });
+}
+
+// Ring (triangle profile revolved around circle path)
+function getRingGeometry(): UnitGeometry {
+  return cachedGeo('ring', () => {
+    const ringSegs = 12;
+    const R = 0.35;
+    const r = 0.18;
+    const verts: number[] = [];
+    const idx: number[] = [];
+    // 3 corners of equilateral triangle profile
+    const profileOffsets: [number, number][] = [];
+    for (let k = 0; k < 3; k++) {
+      const a = (k / 3) * Math.PI * 2 - Math.PI / 2;
+      profileOffsets.push([Math.cos(a) * r, Math.sin(a) * r]);
+    }
+    for (let i = 0; i <= ringSegs; i++) {
+      const u = (i / ringSegs) * Math.PI * 2;
+      const cu = Math.cos(u), su = Math.sin(u);
+      for (const [pr, pz] of profileOffsets) {
+        verts.push((R + pr) * cu, (R + pr) * su, pz);
+      }
+    }
+    const pn = 3;
+    for (let i = 0; i < ringSegs; i++) {
+      const base = i * pn;
+      const next = base + pn;
+      for (let j = 0; j < pn; j++) {
+        const j2 = (j + 1) % pn;
+        idx.push(base + j, next + j, base + j2);
+        idx.push(base + j2, next + j, next + j2);
+      }
+    }
+    return { positions: new Float32Array(verts), indices: new Uint16Array(idx) };
+  });
+}
+
+// Hemisphere (half sphere, flat on bottom)
+function getHemisphereGeometry(): UnitGeometry {
+  return cachedGeo('hemi', () => {
+    const stacks = 4, slices = 8;
+    const verts: number[] = [];
+    const idx: number[] = [];
+    // Bottom center for cap
+    verts.push(0, 0, 0); // vertex 0
+    // Only upper hemisphere (phi from 0 to PI/2)
+    for (let i = 0; i <= stacks; i++) {
+      const phi = (i / stacks) * Math.PI / 2;
+      const sp = Math.sin(phi), cp = Math.cos(phi);
+      for (let j = 0; j <= slices; j++) {
+        const theta = (j / slices) * Math.PI * 2;
+        verts.push(sp * Math.cos(theta) * 0.5, sp * Math.sin(theta) * 0.5, cp * 0.5);
+      }
+    }
+    const w = slices + 1;
+    // Bottom cap: connect center to bottom ring (stack 4 = equator, widest)
+    const eqBase = 1 + stacks * w; // equator ring start
+    for (let j = 0; j < slices; j++) {
+      idx.push(0, eqBase + j + 1, eqBase + j);
+    }
+    // Hemisphere surface
+    for (let i = 0; i < stacks; i++) {
+      for (let j = 0; j < slices; j++) {
+        const a = 1 + i * w + j, b = a + 1, c = a + w, d = c + 1;
+        idx.push(a, c, b);
+        idx.push(b, c, d);
+      }
+    }
+    return { positions: new Float32Array(verts), indices: new Uint16Array(idx) };
+  });
+}
+
+function getUnitGeometry(pathCurve: number, profileCurve: number): UnitGeometry {
+  // ProfileCurve encodes ProfileShape in low nibble, HoleType in high nibble
+  const profileShape = profileCurve & 0x0F;
+
+  // Circular path (revolved shapes): pathCurve=32 or 48
+  if (pathCurve === 32 || pathCurve === 48) {
+    if (profileShape === 5) return getSphereGeometry();     // half-circle revolved = sphere
+    if (profileShape === 0) return getTorusGeometry();      // circle revolved = torus
+    if (profileShape === 1) return getTubeGeometry();       // square revolved = tube
+    if (profileShape === 2 || profileShape === 3 || profileShape === 4) return getRingGeometry(); // triangle revolved = ring
+    return getTorusGeometry(); // fallback for circular path
+  }
+
+  // Linear path (extruded shapes): pathCurve=16 (default)
+  if (profileShape === 0) return getCylinderGeometry();     // circle extruded = cylinder
+  if (profileShape === 5) return getConeGeometry();         // half-circle extruded = cone
+  if (profileShape === 1) return getBoxGeometry();          // square extruded = box
+  if (profileShape === 2) return getPrismGeometry();        // isometric triangle
+  if (profileShape === 3) return getPrismGeometry();        // equilateral triangle (same mesh)
+  if (profileShape === 4) return getWedgeGeometry();        // right triangle = wedge
+  // default: box
+  return getBoxGeometry();
+}
+
+// Shared full-size raster target for object rendering (matches FP pixel buffer)
+let objFullTarget: ReturnType<typeof createRasterTarget> | null = null;
+
+function getObjFullTarget(pw: number, ph: number): ReturnType<typeof createRasterTarget> {
+  if (!objFullTarget || objFullTarget.width !== pw || objFullTarget.height !== ph) {
+    objFullTarget = createRasterTarget(pw, ph);
+    objFullTarget.oids = new Array(pw * ph);
+  }
+  return objFullTarget;
+}
+
+function clearObjFullTarget(target: ReturnType<typeof createRasterTarget>): void {
+  clearRasterTarget(target);
+  if (target.oids) target.oids.fill(undefined);
+}
+
+/** Convert NDC depth to world distance (linearize perspective depth) */
+function ndcDepthToWorldDist(ndcZ: number, near: number, far: number): number {
+  return (2 * near * far) / (far + near - ndcZ * (far - near));
+}
+
+// ─── Triangle-based terrain renderer ──────────────────────────────
+// Builds a triangle mesh from terrain heights around the camera and
+// rasterizes it using the soft rasterizer with proper perspective.
+
+// Reusable terrain raster target
+let terrainRasterTarget: ReturnType<typeof createRasterTarget> | null = null;
+
+function renderTerrainTriangles(
+  buf: FPPixelBuffer, pw: number, ph: number,
+  terrain: (x: number, y: number) => number,
+  selfX: number, selfY: number, selfZ: number, yaw: number,
+  waterHeight: number,
+  fogColor: [number, number, number],
+  maxDepth: number,
+  fov: number,
+): void {
+  // Ensure raster target matches FP pixel buffer size
+  if (!terrainRasterTarget || terrainRasterTarget.width !== pw || terrainRasterTarget.height !== ph) {
+    terrainRasterTarget = createRasterTarget(pw, ph);
+  }
+  clearRasterTarget(terrainRasterTarget);
+
+  // Build view + projection matrices
+  const fwdX = Math.cos(yaw), fwdY = Math.sin(yaw);
+  const eye = [selfX, selfY, selfZ];
+  const lookAt = [selfX + fwdX * 10, selfY + fwdY * 10, selfZ];
+  const view = new Float32Array(16);
+  mat4LookAt(view, eye, lookAt, [0, 0, 1]);
+  const aspect = pw / ph;
+  const proj = new Float32Array(16);
+  // Use vertical FOV derived from horizontal FOV and aspect ratio
+  const vFov = 2 * Math.atan(Math.tan(fov / 2) / aspect);
+  mat4Perspective(proj, vFov, aspect, 0.5, maxDepth);
+  const vp = new Float32Array(16);
+  mat4Multiply(vp, proj, view);
+
+  // Terrain mesh grid: sample around camera position
+  // Use adaptive LOD: 1m cells near, 2m cells mid, 4m cells far
+  const NEAR_RADIUS = 24;   // 1m cells within 24m
+  const MID_RADIUS = 48;    // 2m cells within 48m
+  const FAR_RADIUS = 96;    // 4m cells within 96m
+
+  // Generate terrain patches at different LODs
+  renderTerrainPatch(terrainRasterTarget, terrain, vp, selfX, selfY, waterHeight, fogColor, maxDepth, 1, NEAR_RADIUS);
+  renderTerrainPatch(terrainRasterTarget, terrain, vp, selfX, selfY, waterHeight, fogColor, maxDepth, 2, MID_RADIUS);
+  renderTerrainPatch(terrainRasterTarget, terrain, vp, selfX, selfY, waterHeight, fogColor, maxDepth, 4, FAR_RADIUS);
+
+  // Copy rasterized terrain into the FP pixel buffer
+  for (let py = 0; py < ph; py++) {
+    for (let px = 0; px < pw; px++) {
+      const si = (py * pw + px) * 4;
+      if (terrainRasterTarget.color[si + 3] === 0) continue;
+      const depth = terrainRasterTarget.depth[py * pw + px];
+      // Convert NDC depth to approximate world distance for fog
+      setFPPixel(buf, px, py,
+        terrainRasterTarget.color[si],
+        terrainRasterTarget.color[si + 1],
+        terrainRasterTarget.color[si + 2],
+        undefined, depth);
+    }
+  }
+}
+
+function renderTerrainPatch(
+  target: ReturnType<typeof createRasterTarget>,
+  terrain: (x: number, y: number) => number,
+  vp: Float32Array,
+  selfX: number, selfY: number,
+  waterHeight: number,
+  fogColor: [number, number, number],
+  maxDepth: number,
+  step: number,
+  radius: number,
+): void {
+  // Grid centered on camera, snapped to step size
+  const cx = Math.floor(selfX / step) * step;
+  const cy = Math.floor(selfY / step) * step;
+  const halfR = Math.floor(radius / step);
+
+  // Identity model matrix (terrain is in world coords)
+  const model = new Float32Array(16);
+  model[0] = 1; model[5] = 1; model[10] = 1; model[15] = 1;
+  const mvp = new Float32Array(16);
+  mat4Multiply(mvp, vp, model);
+
+  // Rasterize each terrain cell as 2 triangles
+  for (let dy = -halfR; dy < halfR; dy++) {
+    for (let dx = -halfR; dx < halfR; dx++) {
+      const wx = cx + dx * step;
+      const wy = cy + dy * step;
+
+      // Skip out-of-bounds
+      if (wx < 0 || wx >= 255 || wy < 0 || wy >= 255) continue;
+
+      // Skip cells in inner LOD range (already rendered at higher detail)
+      if (step > 1) {
+        const distX = Math.abs(wx + step / 2 - selfX);
+        const distY = Math.abs(wy + step / 2 - selfY);
+        const innerRadius = step === 2 ? 24 : 48; // skip if covered by finer LOD
+        if (distX < innerRadius && distY < innerRadius) continue;
+      }
+
+      // 4 corners of the cell
+      const x0 = wx, y0 = wy;
+      const x1 = Math.min(wx + step, 255), y1 = Math.min(wy + step, 255);
+      const h00 = terrain(x0, y0);
+      const h10 = terrain(x1, y0);
+      const h01 = terrain(x0, y1);
+      const h11 = terrain(x1, y1);
+
+      // Average height for coloring
+      const hAvg = (h00 + h10 + h01 + h11) / 4;
+      const dist = Math.sqrt((wx + step / 2 - selfX) ** 2 + (wy + step / 2 - selfY) ** 2);
+      let [r, g, b] = terrainRGB(hAvg, waterHeight);
+      // Water surface tint
+      if (hAvg < waterHeight) {
+        [r, g, b] = [0x44, 0x88, 0xbb];
+      }
+      [r, g, b] = fogRGB(r, g, b, dist, maxDepth, fogColor);
+
+      // Two triangles per cell
+      const positions = new Float32Array([
+        x0, y0, h00,
+        x1, y0, h10,
+        x0, y1, h01,
+        x1, y1, h11,
+      ]);
+      const indices = new Uint16Array([
+        0, 1, 2, // lower-left triangle
+        1, 3, 2, // upper-right triangle
+      ]);
+
+      rasterize(target, positions, indices, mvp, r, g, b);
+    }
+  }
+}
+
 export function projectFirstPerson(
   terrain: (x: number, y: number) => number,
   avatars: AvatarData[],
@@ -597,7 +1100,8 @@ export function projectFirstPerson(
   cols: number,
   rows: number,
 ): GridFrame {
-  const { selfX, selfY, selfZ, yaw, waterHeight, ditherPhase, skyColors } = params;
+  const { selfX, selfY, selfZ, yaw, waterHeight, ditherPhase, skyColors, renderMode } = params;
+  const useTriangles = renderMode === 'triangle';
   const dither = ditherPhase !== undefined && ditherPhase > 0;
 
   // Sky colors from region environment, or defaults
@@ -612,12 +1116,6 @@ export function projectFirstPerson(
   const buf = getFPPixelBuffer(pw, ph);
   clearFPPixelBuffer(buf, skyZenith, skyHorizon);
 
-  // ─── Comanche-style voxel space raycasting ───────────────────────
-  // Each pixel column casts a ray from the camera through the view
-  // frustum with proper perspective fan-out. Rays march front-to-back,
-  // projecting terrain height via perspective division, and fill
-  // vertical spans with depth-fogged terrain color.
-
   const fwdX = Math.cos(yaw);
   const fwdY = Math.sin(yaw);
   const rightX = Math.sin(yaw);
@@ -631,129 +1129,118 @@ export function projectFirstPerson(
   const PITCH = 0;                   // look straight ahead (radians, + = up)
   const HORIZON = Math.floor(ph / 2) - Math.round(PITCH * ph / FOV);
 
-  // Per-pixel-column occlusion: highest (lowest py) drawn so far
-  const topDrawn = new Int32Array(pw).fill(ph);
+  if (useTriangles) {
+    // ─── Triangle-based terrain rendering ───────────────────────────
+    // Build a mesh grid around the camera and rasterize it as triangles
+    renderTerrainTriangles(buf, pw, ph, terrain, selfX, selfY, selfZ, yaw, waterHeight, fogColor, MAX_DEPTH, FOV);
+  } else {
+    // ─── Comanche-style voxel space raycasting ───────────────────────
 
-  // Cast one ray per pixel column
-  for (let pcol = 0; pcol < pw; pcol++) {
-    // Ray angle: fan out across the screen
-    // pcol=0 → left of screen → avatar's left → yaw + HALF_FOV (CCW)
-    // pcol=pw → right of screen → avatar's right → yaw - HALF_FOV (CW)
-    const screenFrac = pcol / (pw - 1);  // 0 to 1
-    const rayAngle = yaw + HALF_FOV - screenFrac * FOV;
-    const rayDirX = Math.cos(rayAngle);
-    const rayDirY = Math.sin(rayAngle);
+    // Per-pixel-column occlusion: highest (lowest py) drawn so far
+    const topDrawn = new Int32Array(pw).fill(ph);
 
-    // Cosine correction to prevent fisheye distortion
-    const cosCorrection = Math.cos(rayAngle - yaw);
-
-    // March along the ray front-to-back
-    // Track previous sample's projected screen Y to interpolate spans smoothly
-    let depth = NEAR;
-    let prevScreenPy = ph; // off-screen bottom
-    let prevH = 0;
-    let prevDepth = NEAR;
-    let prevInBounds = false;
-
-    while (depth < MAX_DEPTH && topDrawn[pcol] > 0) {
-      const wx = selfX + rayDirX * depth;
-      const wy = selfY + rayDirY * depth;
-
-      // Apply dither noise — strong nearby (windy grass), fades to near-zero at distance
-      let sampleX = wx, sampleY = wy;
-      if (dither) {
-        const scale = Math.max(0, 1 - depth / 30);
-        if (scale > 0.01) {
-          const [ddx, ddy] = ditherNoise(wx * 0.6, wy * 0.6, ditherPhase!);
-          sampleX += ddx * scale;
-          sampleY += ddy * scale;
-        }
-      }
-
-      if (sampleX >= 0 && sampleX < 256 && sampleY >= 0 && sampleY < 256) {
-        // Bilinear interpolation for smooth terrain
-        const ix = Math.floor(sampleX), iy = Math.floor(sampleY);
-        const fx = sampleX - ix, fy = sampleY - iy;
-        const ix1 = Math.min(ix + 1, 255), iy1 = Math.min(iy + 1, 255);
-        const h00 = terrain(ix, iy), h10 = terrain(ix1, iy);
-        const h01 = terrain(ix, iy1), h11 = terrain(ix1, iy1);
-        const h = h00 * (1 - fx) * (1 - fy) + h10 * fx * (1 - fy)
-                + h01 * (1 - fx) * fy + h11 * fx * fy;
-
-        // Perspective project: screen Y from height difference and corrected depth
-        const correctedDepth = depth * cosCorrection;
-        const heightOnScreen = ((CAMERA_HEIGHT - h) / correctedDepth) * ph;
-        const screenPy = Math.round(HORIZON + heightOnScreen);
-
-        // Connect to previous sample: interpolate between prevScreenPy and screenPy
-        // This fills the vertical gap between consecutive samples smoothly
-        // instead of leaving spiky gaps
-        let drawTop = screenPy;
-        if (prevInBounds && prevScreenPy < topDrawn[pcol] && drawTop > prevScreenPy) {
-          // Previous sample projected higher on screen — fill the gap between them
-          // by extending the current sample's span up to meet the previous one
-          drawTop = prevScreenPy;
-        }
-
-        if (drawTop < topDrawn[pcol]) {
-          const drawFrom = Math.max(0, drawTop);
-          const drawTo = topDrawn[pcol];
-
-          let [tr, tg, tb] = (h < waterHeight)
-            ? waterPixelRGB(h, waterHeight, sampleX, sampleY, depth)
-            : terrainRGB(h, waterHeight);
-
-          // Slope-based shading: compute terrain gradient for directional light
-          if (h >= waterHeight) {
-            const gx = h10 - h00;
-            const gy = h01 - h00;
-            const shade = 0.85 + 0.15 * Math.max(-1, Math.min(1, (-gx + gy) * 0.3));
-            tr = Math.round(tr * shade);
-            tg = Math.round(tg * shade);
-            tb = Math.round(tb * shade);
-          }
-
-          [tr, tg, tb] = fogRGB(tr, tg, tb, depth, MAX_DEPTH, fogColor);
-
-          // Vertical gradient within span for sextant detail
-          const spanLen = drawTo - drawFrom;
-          for (let py = drawFrom; py < drawTo; py++) {
-            if (spanLen > 1) {
-              const vt = (py - drawFrom) / (spanLen - 1);
-              const vShade = 1.08 - 0.16 * vt;
-              setFPPixel(buf, pcol, py,
-                Math.min(255, Math.round(tr * vShade)),
-                Math.min(255, Math.round(tg * vShade)),
-                Math.min(255, Math.round(tb * vShade)),
-                undefined, correctedDepth);
-            } else {
-              setFPPixel(buf, pcol, py, tr, tg, tb, undefined, correctedDepth);
-            }
-          }
-
-          topDrawn[pcol] = drawFrom;
-        }
-
-        prevScreenPy = screenPy;
-        prevH = h;
-        prevDepth = depth;
-        prevInBounds = true;
-      } else {
-        prevInBounds = false;
-      }
-
-      // Adaptive step: finer steps close, coarser far away
-      // Step size proportional to depth ensures ~constant screen-space sampling
-      depth += Math.max(0.4, depth * 0.04);
-    }
-  }
-
-  // Horizon line through remaining sky columns
-  const horizonPy = HORIZON;
-  if (horizonPy >= 0 && horizonPy < ph) {
+    // Cast one ray per pixel column
     for (let pcol = 0; pcol < pw; pcol++) {
-      if (topDrawn[pcol] > horizonPy) {
-        setFPPixel(buf, pcol, horizonPy, skyHorizon[0], skyHorizon[1], skyHorizon[2]);
+      const screenFrac = pcol / (pw - 1);
+      const rayAngle = yaw + HALF_FOV - screenFrac * FOV;
+      const rayDirX = Math.cos(rayAngle);
+      const rayDirY = Math.sin(rayAngle);
+      const cosCorrection = Math.cos(rayAngle - yaw);
+
+      let depth = NEAR;
+      let prevScreenPy = ph;
+      let prevH = 0;
+      let prevDepth = NEAR;
+      let prevInBounds = false;
+
+      while (depth < MAX_DEPTH && topDrawn[pcol] > 0) {
+        const wx = selfX + rayDirX * depth;
+        const wy = selfY + rayDirY * depth;
+
+        let sampleX = wx, sampleY = wy;
+        if (dither) {
+          const scale = Math.max(0, 1 - depth / 30);
+          if (scale > 0.01) {
+            const [ddx, ddy] = ditherNoise(wx * 0.6, wy * 0.6, ditherPhase!);
+            sampleX += ddx * scale;
+            sampleY += ddy * scale;
+          }
+        }
+
+        if (sampleX >= 0 && sampleX < 256 && sampleY >= 0 && sampleY < 256) {
+          const ix = Math.floor(sampleX), iy = Math.floor(sampleY);
+          const fx = sampleX - ix, fy = sampleY - iy;
+          const ix1 = Math.min(ix + 1, 255), iy1 = Math.min(iy + 1, 255);
+          const h00 = terrain(ix, iy), h10 = terrain(ix1, iy);
+          const h01 = terrain(ix, iy1), h11 = terrain(ix1, iy1);
+          const h = h00 * (1 - fx) * (1 - fy) + h10 * fx * (1 - fy)
+                  + h01 * (1 - fx) * fy + h11 * fx * fy;
+
+          const correctedDepth = depth * cosCorrection;
+          const heightOnScreen = ((CAMERA_HEIGHT - h) / correctedDepth) * ph;
+          const screenPy = Math.round(HORIZON + heightOnScreen);
+
+          let drawTop = screenPy;
+          if (prevInBounds && prevScreenPy < topDrawn[pcol] && drawTop > prevScreenPy) {
+            drawTop = prevScreenPy;
+          }
+
+          if (drawTop < topDrawn[pcol]) {
+            const drawFrom = Math.max(0, drawTop);
+            const drawTo = topDrawn[pcol];
+
+            let [tr, tg, tb] = (h < waterHeight)
+              ? waterPixelRGB(h, waterHeight, sampleX, sampleY, depth)
+              : terrainRGB(h, waterHeight);
+
+            if (h >= waterHeight) {
+              const gx = h10 - h00;
+              const gy = h01 - h00;
+              const shade = 0.85 + 0.15 * Math.max(-1, Math.min(1, (-gx + gy) * 0.3));
+              tr = Math.round(tr * shade);
+              tg = Math.round(tg * shade);
+              tb = Math.round(tb * shade);
+            }
+
+            [tr, tg, tb] = fogRGB(tr, tg, tb, depth, MAX_DEPTH, fogColor);
+
+            const spanLen = drawTo - drawFrom;
+            for (let py = drawFrom; py < drawTo; py++) {
+              if (spanLen > 1) {
+                const vt = (py - drawFrom) / (spanLen - 1);
+                const vShade = 1.08 - 0.16 * vt;
+                setFPPixel(buf, pcol, py,
+                  Math.min(255, Math.round(tr * vShade)),
+                  Math.min(255, Math.round(tg * vShade)),
+                  Math.min(255, Math.round(tb * vShade)),
+                  undefined, correctedDepth);
+              } else {
+                setFPPixel(buf, pcol, py, tr, tg, tb, undefined, correctedDepth);
+              }
+            }
+
+            topDrawn[pcol] = drawFrom;
+          }
+
+          prevScreenPy = screenPy;
+          prevH = h;
+          prevDepth = depth;
+          prevInBounds = true;
+        } else {
+          prevInBounds = false;
+        }
+
+        depth += Math.max(0.4, depth * 0.04);
+      }
+    }
+
+    // Horizon line through remaining sky columns
+    const horizonPy = HORIZON;
+    if (horizonPy >= 0 && horizonPy < ph) {
+      for (let pcol = 0; pcol < pw; pcol++) {
+        if (topDrawn[pcol] > horizonPy) {
+          setFPPixel(buf, pcol, horizonPy, skyHorizon[0], skyHorizon[1], skyHorizon[2]);
+        }
       }
     }
   }
@@ -779,24 +1266,96 @@ export function projectFirstPerson(
     return { px, py, dist: forwardDist };
   }
 
-  // Objects (rendered as pixel rectangles with perspective sizing)
-  for (const obj of objects) {
-    const proj = worldToScreen(obj.x, obj.y, obj.z + obj.scaleZ / 2);
-    if (!proj) continue;
-    const { px: screenPx, py: screenPy, dist: forwardDist } = proj;
-    if (screenPy < 0 || screenPy >= ph) continue;
+  // Objects: near objects rendered as 3D shapes, far objects as tinted rectangles
+  // Sort by distance (far first) for correct occlusion via depth buffer
+  const sortedObjects = objects
+    .map(obj => {
+      const dx = obj.x - selfX, dy = obj.y - selfY;
+      const dist = dx * fwdX + dy * fwdY;
+      return { obj, dist };
+    })
+    .filter(o => o.dist > NEAR && o.dist < MAX_DEPTH)
+    .sort((a, b) => b.dist - a.dist);
 
-    const baseRGB: [number, number, number] = obj.isTree ? [0x33, 0x66, 0x33] : [0x88, 0x55, 0x22];
-    const [or, og, ob] = fogRGB(baseRGB[0], baseRGB[1], baseRGB[2], forwardDist, MAX_DEPTH, fogColor);
+  // Near-object 3D rendering (closest 200 prims within 40m)
+  const nearObjects = sortedObjects.filter(o => o.dist < 40 && !o.obj.isTree).slice(-200);
+  const nearSet = new Set(nearObjects.map(o => o.obj.uuid));
 
-    const entityPxH = Math.max(2, Math.round((obj.scaleZ || 2) / forwardDist * ph));
-    const entityPxW = Math.max(2, Math.round((Math.max(obj.scaleX, obj.scaleY) || 1) / forwardDist * ph));
-    const startPy = Math.max(0, screenPy - entityPxH + 1);
-    const startPx = screenPx - Math.floor(entityPxW / 2);
+  // Build shared view/projection for object rasterization (same frustum as terrain triangles)
+  const objEye = [selfX, selfY, selfZ];
+  const objLookAt = [selfX + fwdX * 10, selfY + fwdY * 10, selfZ];
+  const objView = new Float32Array(16);
+  mat4LookAt(objView, objEye, objLookAt, [0, 0, 1]);
+  const aspect = pw / ph;
+  const vFovObj = 2 * Math.atan(Math.tan(FOV / 2) / aspect);
+  const objProj = new Float32Array(16);
+  mat4Perspective(objProj, vFovObj, aspect, 0.5, MAX_DEPTH);
+  const objModel = new Float32Array(16);
+  const objMV = new Float32Array(16);
+  const objMVP = new Float32Array(16);
 
-    for (let py = startPy; py <= screenPy && py < ph; py++) {
-      for (let px = startPx; px < startPx + entityPxW && px < pw; px++) {
-        setFPPixel(buf, px, py, or, og, ob, obj.uuid, forwardDist);
+  // Rasterize all near objects into a single full-size target
+  const objTarget = getObjFullTarget(pw, ph);
+  clearObjFullTarget(objTarget);
+
+  for (const { obj, dist: forwardDist } of nearObjects) {
+    const geo = getUnitGeometry(obj.pathCurve, obj.profileCurve);
+    mat4ModelPosScaleRot(
+      objModel,
+      obj.x, obj.y, obj.z + obj.scaleZ / 2,
+      obj.scaleX, obj.scaleY, obj.scaleZ,
+      obj.rotX, obj.rotY, obj.rotZ, obj.rotW,
+    );
+    mat4Multiply(objMV, objView, objModel);
+    mat4Multiply(objMVP, objProj, objMV);
+    const [fr, fg, fb] = fogRGB(obj.colorR, obj.colorG, obj.colorB, forwardDist, MAX_DEPTH, fogColor);
+    rasterize(objTarget, geo.positions, geo.indices, objMVP, fr, fg, fb, obj.uuid);
+  }
+
+  // Copy rasterized object pixels to FP buffer with depth conversion
+  const isVoxelMode = !useTriangles;
+  for (let py = 0; py < ph; py++) {
+    for (let px = 0; px < pw; px++) {
+      const si = (py * pw + px) * 4;
+      if (objTarget.color[si + 3] === 0) continue;
+      const idx = py * pw + px;
+      const ndcZ = objTarget.depth[idx];
+      // In voxel mode, FP buffer depth is world distance — linearize NDC depth
+      const pixDepth = isVoxelMode ? ndcDepthToWorldDist(ndcZ, 0.5, MAX_DEPTH) : ndcZ;
+      const oid = objTarget.oids ? objTarget.oids[idx] : undefined;
+      setFPPixel(buf, px, py, objTarget.color[si], objTarget.color[si + 1], objTarget.color[si + 2], oid, pixDepth);
+    }
+  }
+
+  // Far/tree objects: tinted rectangles
+  for (const { obj, dist: forwardDist } of sortedObjects) {
+    if (nearSet.has(obj.uuid)) continue;
+    {
+      const proj = worldToScreen(obj.x, obj.y, obj.z + obj.scaleZ / 2);
+      if (!proj) continue;
+      const { px: screenPx, py: screenPy } = proj;
+      if (screenPy < 0 || screenPy >= ph) continue;
+
+      // Use actual object color (or tree green for trees)
+      const baseR = obj.isTree ? 0x33 : obj.colorR;
+      const baseG = obj.isTree ? 0x66 : obj.colorG;
+      const baseB = obj.isTree ? 0x33 : obj.colorB;
+      const [or, og, ob] = fogRGB(baseR, baseG, baseB, forwardDist, MAX_DEPTH, fogColor);
+
+      const entityPxH = Math.max(2, Math.round((obj.scaleZ || 2) / forwardDist * ph));
+      const entityPxW = Math.max(2, Math.round((Math.max(obj.scaleX, obj.scaleY) || 1) / forwardDist * ph));
+      const startPy = Math.max(0, screenPy - entityPxH + 1);
+      const startPx = screenPx - Math.floor(entityPxW / 2);
+
+      // Tree silhouettes for near-ish trees
+      if (obj.isTree && forwardDist < 50) {
+        renderTreePixels(buf, pw, ph, obj.treeSpecies, obj.pcode, screenPx, screenPy, entityPxH, or, og, ob, obj.uuid, forwardDist);
+      } else {
+        for (let py = startPy; py <= screenPy && py < ph; py++) {
+          for (let px = startPx; px < startPx + entityPxW && px < pw; px++) {
+            setFPPixel(buf, px, py, or, og, ob, obj.uuid, forwardDist);
+          }
+        }
       }
     }
   }
@@ -846,7 +1405,8 @@ export function projectFirstPerson(
 
     if (!rendered) {
       const [ar, ag, ab] = fogRGB(0x30, 0x30, 0x30, forwardDist, MAX_DEPTH, fogColor);
-      renderPixelAvatar(buf, pw, ph, screenPx, headPy, figH, ar, ag, ab, av.uuid, forwardDist);
+      const velMag = Math.sqrt(av.velX * av.velX + av.velY * av.velY + av.velZ * av.velZ);
+      renderPixelAvatar(buf, pw, ph, screenPx, headPy, figH, ar, ag, ab, av.uuid, forwardDist, velMag);
     }
   }
 
@@ -910,12 +1470,124 @@ export function projectFirstPerson(
   return { cells, cols: cellCols, rows: cellRows };
 }
 
+// Render a tree/grass silhouette into the FP pixel buffer
+function renderTreePixels(
+  buf: FPPixelBuffer, pw: number, ph: number,
+  species: number, pcode: number,
+  centerPx: number, basePy: number, figH: number,
+  r: number, g: number, b: number, uuid: string, depth: number,
+): void {
+  if (figH < 2) {
+    setFPPixel(buf, centerPx, basePy, r, g, b, uuid, depth);
+    return;
+  }
+
+  // Grass (PCode=95): short vertical strokes
+  if (pcode === 95) {
+    const bladeCount = Math.max(2, Math.min(6, Math.round(figH * 0.8)));
+    for (let i = 0; i < bladeCount; i++) {
+      const bx = centerPx - Math.floor(bladeCount / 2) + i;
+      const bladeH = Math.max(1, Math.round(figH * (0.5 + Math.sin(i * 2.3) * 0.3)));
+      for (let dy = 0; dy < bladeH; dy++) {
+        const shade = 0.8 + 0.2 * (1 - dy / bladeH);
+        setFPPixel(buf, bx, basePy - dy, Math.round(r * shade), Math.round(g * shade), Math.round(b * shade), uuid, depth);
+      }
+    }
+    return;
+  }
+
+  const trunkR = Math.max(0, r - 30), trunkG = Math.max(0, g - 40), trunkB = Math.max(0, b - 20);
+  const trunkW = Math.max(1, Math.round(figH * 0.04));
+
+  // Pine/Cypress (species 0,7,8,9,11,13): triangular/conical
+  if (species === 0 || species === 7 || species === 8 || species === 9 || species === 11 || species === 13) {
+    const trunkH = Math.round(figH * 0.25);
+    const canopyH = figH - trunkH;
+    // Trunk
+    for (let dy = 0; dy < trunkH; dy++) {
+      for (let dx = -trunkW; dx <= trunkW; dx++) {
+        setFPPixel(buf, centerPx + dx, basePy - dy, trunkR, trunkG, trunkB, uuid, depth);
+      }
+    }
+    // Conical canopy (widest at bottom, point at top)
+    for (let dy = 0; dy < canopyH; dy++) {
+      const t = dy / Math.max(1, canopyH - 1);
+      const w = Math.max(1, Math.round((figH * 0.2) * (1 - t)));
+      const shade = 0.7 + 0.3 * t;
+      for (let dx = -w; dx <= w; dx++) {
+        setFPPixel(buf, centerPx + dx, basePy - trunkH - dy,
+          Math.round(r * shade), Math.round(g * shade), Math.round(b * shade), uuid, depth);
+      }
+    }
+    return;
+  }
+
+  // Palm (species 3,6): tall trunk + fronds at top
+  if (species === 3 || species === 6) {
+    const trunkH = Math.round(figH * 0.7);
+    const frondH = figH - trunkH;
+    // Trunk
+    for (let dy = 0; dy < trunkH; dy++) {
+      for (let dx = -trunkW; dx <= trunkW; dx++) {
+        setFPPixel(buf, centerPx + dx, basePy - dy, trunkR, trunkG, trunkB, uuid, depth);
+      }
+    }
+    // Fronds (wider at center, taper to edges)
+    const frondW = Math.max(2, Math.round(figH * 0.25));
+    for (let dy = 0; dy < frondH; dy++) {
+      const t = dy / Math.max(1, frondH - 1);
+      const w = Math.round(frondW * (1 - Math.abs(t - 0.5) * 2));
+      for (let dx = -w; dx <= w; dx++) {
+        setFPPixel(buf, centerPx + dx, basePy - trunkH - dy, r, g, b, uuid, depth);
+      }
+    }
+    return;
+  }
+
+  // Bush (species 2,5): short, wide
+  if (species === 2 || species === 5) {
+    const bushW = Math.max(2, Math.round(figH * 0.4));
+    for (let dy = 0; dy < figH; dy++) {
+      const t = dy / Math.max(1, figH - 1);
+      const w = Math.round(bushW * Math.sin((t + 0.1) * Math.PI * 0.8));
+      const shade = 0.75 + 0.25 * t;
+      for (let dx = -w; dx <= w; dx++) {
+        setFPPixel(buf, centerPx + dx, basePy - dy,
+          Math.round(r * shade), Math.round(g * shade), Math.round(b * shade), uuid, depth);
+      }
+    }
+    return;
+  }
+
+  // Default: Oak-style (species 1,10 and others) — round canopy on trunk
+  const trunkH = Math.round(figH * 0.35);
+  const canopyH = figH - trunkH;
+  const canopyW = Math.max(2, Math.round(figH * 0.25));
+  // Trunk
+  for (let dy = 0; dy < trunkH; dy++) {
+    for (let dx = -trunkW; dx <= trunkW; dx++) {
+      setFPPixel(buf, centerPx + dx, basePy - dy, trunkR, trunkG, trunkB, uuid, depth);
+    }
+  }
+  // Round canopy
+  for (let dy = 0; dy < canopyH; dy++) {
+    const t = dy / Math.max(1, canopyH - 1);
+    const w = Math.round(canopyW * Math.sin((t + 0.1) * Math.PI * 0.9));
+    const shade = 0.7 + 0.3 * t;
+    for (let dx = -w; dx <= w; dx++) {
+      setFPPixel(buf, centerPx + dx, basePy - trunkH - dy,
+        Math.round(r * shade), Math.round(g * shade), Math.round(b * shade), uuid, depth);
+    }
+  }
+}
+
 // Render a humanoid pixel silhouette into the FP pixel buffer
 function renderPixelAvatar(
   buf: FPPixelBuffer, pw: number, ph: number,
   centerPx: number, headPy: number, figH: number,
   r: number, g: number, b: number, uuid: string,
   avDepth: number,
+  velMag = 0,
 ): void {
   if (figH <= 3) {
     // Tiny: just a dot
@@ -924,6 +1596,10 @@ function renderPixelAvatar(
     }
     return;
   }
+
+  // Walking animation state
+  const isWalking = velMag > 0.5;
+  const walkFrame = isWalking ? (Date.now() % 600 < 300 ? 1 : -1) : 0;
 
   // Proportional humanoid shape with more detail
   const headH = Math.max(2, Math.round(figH * 0.14));
@@ -989,13 +1665,14 @@ function renderPixelAvatar(
         setFPPixel(buf, centerPx + dx, py, r, g, b, uuid, avDepth);
       }
     }
-    // Arms
+    // Arms (swing opposite to legs when walking)
     if (dy >= armStartDy && dy < armEndDy) {
       const armLen = Math.max(1, Math.round(armW + (armEndDy - dy) * 0.2));
       for (let side = -1; side <= 1; side += 2) {
+        // Arm swing: opposite direction to same-side leg
+        const armSwing = isWalking ? -walkFrame * side * Math.min(1, Math.round(figH * 0.015)) : 0;
         for (let ax = 1; ax <= armLen; ax++) {
-          const apx = centerPx + side * (tw + ax);
-          // Arm: skin at lower half (forearm), body color at upper (sleeve)
+          const apx = centerPx + side * (tw + ax) + armSwing;
           const isForearm = dy > armStartDy + (armEndDy - armStartDy) * 0.6;
           if (isForearm) {
             setFPPixel(buf, apx, py, skinR, skinG, skinB, uuid, avDepth);
@@ -1016,11 +1693,13 @@ function renderPixelAvatar(
 
   // Legs (two separate columns that splay slightly)
   for (let dy = 0; dy < legH && py < headPy + figH; dy++, py++) {
-    const splay = Math.min(dy, Math.round(figH * 0.04)) + 1;
+    const baseSplay = Math.min(dy, Math.round(figH * 0.04)) + 1;
     for (let side = -1; side <= 1; side += 2) {
-      const legCenter = centerPx + side * splay;
+      // Walking: alternate legs forward/back
+      const walkOffset = walkFrame * side * Math.min(2, Math.round(figH * 0.03));
+      const legSplay = baseSplay + (isWalking ? Math.abs(walkOffset) : 0);
+      const legCenter = centerPx + side * legSplay + (isWalking ? walkOffset : 0);
       for (let dx = -legW; dx <= legW; dx++) {
-        // Lower legs = skin tone (bare), upper = clothing
         const isSkin = dy > legH * 0.7;
         if (isSkin) {
           setFPPixel(buf, legCenter + dx, py, skinR, skinG, skinB, uuid, avDepth);

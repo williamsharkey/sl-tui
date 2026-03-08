@@ -14,6 +14,7 @@ import {
 import { ChatBuffer } from '../tui/chat-buffer.js';
 import { InputHandler, type Mode } from '../tui/input.js';
 import { createEmptyFrame, diffFrames, projectFirstPerson, projectFrame, type GridFrame, type Cell, type CellDelta, type AvatarData, type ObjectData } from '../server/grid-state.js';
+import { quatRotateVec3, quatMultiply } from '../server/quat-utils.js';
 import type { WritableTarget } from '../tui/types.js';
 
 // ─── Test Framework ──────────────────────────────────────────────
@@ -315,7 +316,7 @@ console.log('\n=== InputHandler ===');
 // Helper for InputHandler callbacks
 function makeCallbacks(overrides: Partial<import('../tui/input.js').InputCallbacks> = {}): import('../tui/input.js').InputCallbacks {
   return {
-    onMove: () => {}, onStop: () => {}, onToggleFly: () => {}, onToggleDither: () => {},
+    onMove: () => {}, onStop: () => {}, onToggleFly: () => {}, onToggleDither: () => {}, onToggleRenderMode: () => {},
     onTurnLeft: () => {}, onTurnRight: () => {},
     onEnterChat: () => {}, onExitChat: () => {},
     onChatSubmit: () => {}, onChatChar: () => {}, onChatBackspace: () => {},
@@ -535,7 +536,7 @@ console.log('\n=== First-Person View ===');
 test('projectFirstPerson returns correct dimensions', () => {
   const fp = projectFirstPerson(
     () => 25,  // flat terrain at height 25
-    [{ uuid: 'self', firstName: 'T', lastName: 'U', x: 128, y: 128, z: 25, yaw: 0, isSelf: true }],
+    [{ uuid: 'self', firstName: 'T', lastName: 'U', x: 128, y: 128, z: 25, yaw: 0, isSelf: true, velX: 0, velY: 0, velZ: 0 }],
     [],
     { selfX: 128, selfY: 128, selfZ: 25, yaw: 0, waterHeight: 20 },
     80, 5,
@@ -548,7 +549,7 @@ test('projectFirstPerson returns correct dimensions', () => {
 test('FP view: terrain at eye level fills around horizon', () => {
   const fp = projectFirstPerson(
     () => 25,
-    [{ uuid: 'self', firstName: 'T', lastName: 'U', x: 128, y: 128, z: 25, yaw: 0, isSelf: true }],
+    [{ uuid: 'self', firstName: 'T', lastName: 'U', x: 128, y: 128, z: 25, yaw: 0, isSelf: true, velX: 0, velY: 0, velZ: 0 }],
     [],
     { selfX: 128, selfY: 128, selfZ: 25, yaw: 0, waterHeight: 20 },
     20, 5,
@@ -566,7 +567,7 @@ test('FP view: terrain at eye level fills around horizon', () => {
 test('FP view: flying high shows mostly sky', () => {
   const fp = projectFirstPerson(
     () => 25,
-    [{ uuid: 'self', firstName: 'T', lastName: 'U', x: 128, y: 128, z: 200, yaw: 0, isSelf: true }],
+    [{ uuid: 'self', firstName: 'T', lastName: 'U', x: 128, y: 128, z: 200, yaw: 0, isSelf: true, velX: 0, velY: 0, velZ: 0 }],
     [],
     { selfX: 128, selfY: 128, selfZ: 200, yaw: 0, waterHeight: 20 },
     20, 5,
@@ -642,8 +643,8 @@ test('login mode: control chars are ignored', () => {
 console.log('\n=== Avatar Rendering ===');
 
 test('FP view: avatar on flat terrain is visible', () => {
-  const self: AvatarData = { uuid: 'self', firstName: 'T', lastName: 'U', x: 128, y: 128, z: 25, yaw: Math.PI / 2, isSelf: true };
-  const other: AvatarData = { uuid: 'other-1', firstName: 'O', lastName: 'A', x: 128, y: 140, z: 25, yaw: 0, isSelf: false };
+  const self: AvatarData = { uuid: 'self', firstName: 'T', lastName: 'U', x: 128, y: 128, z: 25, yaw: Math.PI / 2, isSelf: true, velX: 0, velY: 0, velZ: 0 };
+  const other: AvatarData = { uuid: 'other-1', firstName: 'O', lastName: 'A', x: 128, y: 140, z: 25, yaw: 0, isSelf: false, velX: 0, velY: 0, velZ: 0 };
   const fp = projectFirstPerson(
     () => 25,
     [self, other],
@@ -662,8 +663,8 @@ test('FP view: avatar behind hill is partially occluded', () => {
     if (y >= 133 && y <= 136) return 35; // 10m hill at y=133-136
     return 25;
   };
-  const self: AvatarData = { uuid: 'self', firstName: 'T', lastName: 'U', x: 128, y: 128, z: 25, yaw: Math.PI / 2, isSelf: true };
-  const other: AvatarData = { uuid: 'other-1', firstName: 'O', lastName: 'A', x: 128, y: 145, z: 25, yaw: 0, isSelf: false };
+  const self: AvatarData = { uuid: 'self', firstName: 'T', lastName: 'U', x: 128, y: 128, z: 25, yaw: Math.PI / 2, isSelf: true, velX: 0, velY: 0, velZ: 0 };
+  const other: AvatarData = { uuid: 'other-1', firstName: 'O', lastName: 'A', x: 128, y: 145, z: 25, yaw: 0, isSelf: false, velX: 0, velY: 0, velZ: 0 };
 
   const fp = projectFirstPerson(
     terrain,
@@ -682,9 +683,9 @@ test('FP view: avatar behind hill is partially occluded', () => {
 });
 
 test('FP view: close avatar renders larger than far avatar', () => {
-  const self: AvatarData = { uuid: 'self', firstName: 'T', lastName: 'U', x: 128, y: 128, z: 25, yaw: Math.PI / 2, isSelf: true };
-  const close: AvatarData = { uuid: 'close-1', firstName: 'C', lastName: 'A', x: 128, y: 133, z: 25, yaw: 0, isSelf: false };
-  const far: AvatarData = { uuid: 'far-1', firstName: 'F', lastName: 'A', x: 128, y: 170, z: 25, yaw: 0, isSelf: false };
+  const self: AvatarData = { uuid: 'self', firstName: 'T', lastName: 'U', x: 128, y: 128, z: 25, yaw: Math.PI / 2, isSelf: true, velX: 0, velY: 0, velZ: 0 };
+  const close: AvatarData = { uuid: 'close-1', firstName: 'C', lastName: 'A', x: 128, y: 133, z: 25, yaw: 0, isSelf: false, velX: 0, velY: 0, velZ: 0 };
+  const far: AvatarData = { uuid: 'far-1', firstName: 'F', lastName: 'A', x: 128, y: 170, z: 25, yaw: 0, isSelf: false, velX: 0, velY: 0, velZ: 0 };
 
   const fp = projectFirstPerson(
     () => 25,
@@ -701,8 +702,8 @@ test('FP view: close avatar renders larger than far avatar', () => {
 test('FP view: avatar in front of terrain overwrites terrain pixels', () => {
   // Terrain slopes up behind the avatar
   const terrain = (x: number, y: number) => y > 140 ? 40 : 25;
-  const self: AvatarData = { uuid: 'self', firstName: 'T', lastName: 'U', x: 128, y: 128, z: 25, yaw: Math.PI / 2, isSelf: true };
-  const other: AvatarData = { uuid: 'other-1', firstName: 'O', lastName: 'A', x: 128, y: 135, z: 25, yaw: 0, isSelf: false };
+  const self: AvatarData = { uuid: 'self', firstName: 'T', lastName: 'U', x: 128, y: 128, z: 25, yaw: Math.PI / 2, isSelf: true, velX: 0, velY: 0, velZ: 0 };
+  const other: AvatarData = { uuid: 'other-1', firstName: 'O', lastName: 'A', x: 128, y: 135, z: 25, yaw: 0, isSelf: false, velX: 0, velY: 0, velZ: 0 };
 
   const fp = projectFirstPerson(
     terrain,
@@ -716,8 +717,8 @@ test('FP view: avatar in front of terrain overwrites terrain pixels', () => {
 });
 
 test('FP view: object uses depth buffer correctly', () => {
-  const self: AvatarData = { uuid: 'self', firstName: 'T', lastName: 'U', x: 128, y: 128, z: 25, yaw: Math.PI / 2, isSelf: true };
-  const obj: ObjectData = { uuid: 'box-1', name: 'Box', x: 128, y: 138, z: 25, scaleX: 2, scaleY: 2, scaleZ: 3, isTree: false };
+  const self: AvatarData = { uuid: 'self', firstName: 'T', lastName: 'U', x: 128, y: 128, z: 25, yaw: Math.PI / 2, isSelf: true, velX: 0, velY: 0, velZ: 0 };
+  const obj: ObjectData = { uuid: 'box-1', name: 'Box', x: 128, y: 138, z: 25, scaleX: 2, scaleY: 2, scaleZ: 3, isTree: false, pcode: 9, treeSpecies: -1, pathCurve: 16, profileCurve: 1, rotX: 0, rotY: 0, rotZ: 0, rotW: 1, colorR: 128, colorG: 128, colorB: 128 };
 
   const fp = projectFirstPerson(
     () => 25,
@@ -731,8 +732,8 @@ test('FP view: object uses depth buffer correctly', () => {
 });
 
 test('FP view: name labels render next to avatar', () => {
-  const self: AvatarData = { uuid: 'self', firstName: 'T', lastName: 'U', x: 128, y: 128, z: 25, yaw: Math.PI / 2, isSelf: true };
-  const other: AvatarData = { uuid: 'other-1', firstName: 'Test', lastName: 'Person', x: 128, y: 140, z: 25, yaw: 0, isSelf: false };
+  const self: AvatarData = { uuid: 'self', firstName: 'T', lastName: 'U', x: 128, y: 128, z: 25, yaw: Math.PI / 2, isSelf: true, velX: 0, velY: 0, velZ: 0 };
+  const other: AvatarData = { uuid: 'other-1', firstName: 'Test', lastName: 'Person', x: 128, y: 140, z: 25, yaw: 0, isSelf: false, velX: 0, velY: 0, velZ: 0 };
   const names = new Map([['other-1', 'Test Person']]);
 
   const fp = projectFirstPerson(
@@ -749,8 +750,8 @@ test('FP view: name labels render next to avatar', () => {
 });
 
 test('FP view: chat bubble renders next to avatar name', () => {
-  const self: AvatarData = { uuid: 'self', firstName: 'T', lastName: 'U', x: 128, y: 128, z: 25, yaw: Math.PI / 2, isSelf: true };
-  const other: AvatarData = { uuid: 'other-1', firstName: 'Test', lastName: 'Person', x: 128, y: 140, z: 25, yaw: 0, isSelf: false };
+  const self: AvatarData = { uuid: 'self', firstName: 'T', lastName: 'U', x: 128, y: 128, z: 25, yaw: Math.PI / 2, isSelf: true, velX: 0, velY: 0, velZ: 0 };
+  const other: AvatarData = { uuid: 'other-1', firstName: 'Test', lastName: 'Person', x: 128, y: 140, z: 25, yaw: 0, isSelf: false, velX: 0, velY: 0, velZ: 0 };
   const names = new Map([['other-1', 'Test Person']]);
   const bubbles = new Map([['other-1', { message: 'Hello world', ts: Date.now() }]]);
 
@@ -768,9 +769,9 @@ test('FP view: chat bubble renders next to avatar name', () => {
 
 test('Minimap: avatar altitude indicators + and -', () => {
   // Use a larger grid and place avatars far enough from self so indicators don't overlap with @ or FOV
-  const self: AvatarData = { uuid: 'self', firstName: 'T', lastName: 'U', x: 128, y: 128, z: 25, yaw: Math.PI / 2, isSelf: true };
-  const higher: AvatarData = { uuid: 'high-1', firstName: 'H', lastName: 'A', x: 128, y: 160, z: 35, yaw: 0, isSelf: false };
-  const lower: AvatarData = { uuid: 'low-1', firstName: 'L', lastName: 'A', x: 160, y: 128, z: 15, yaw: 0, isSelf: false };
+  const self: AvatarData = { uuid: 'self', firstName: 'T', lastName: 'U', x: 128, y: 128, z: 25, yaw: Math.PI / 2, isSelf: true, velX: 0, velY: 0, velZ: 0 };
+  const higher: AvatarData = { uuid: 'high-1', firstName: 'H', lastName: 'A', x: 128, y: 160, z: 35, yaw: 0, isSelf: false, velX: 0, velY: 0, velZ: 0 };
+  const lower: AvatarData = { uuid: 'low-1', firstName: 'L', lastName: 'A', x: 160, y: 128, z: 15, yaw: 0, isSelf: false, velX: 0, velY: 0, velZ: 0 };
 
   const frame = projectFrame(
     () => 25,
@@ -788,7 +789,7 @@ test('Minimap: sim border markers appear near region edge', () => {
   // Place self near the edge of the sim (x=5)
   const frame = projectFrame(
     () => 25,
-    [{ uuid: 'self', firstName: 'T', lastName: 'U', x: 5, y: 128, z: 25, yaw: Math.PI / 2, isSelf: true }],
+    [{ uuid: 'self', firstName: 'T', lastName: 'U', x: 5, y: 128, z: 25, yaw: Math.PI / 2, isSelf: true, velX: 0, velY: 0, velZ: 0 }],
     [],
     { cols: 20, rows: 20, selfX: 5, selfY: 128, selfZ: 25, waterHeight: 20, metersPerCell: 256 / 20, yaw: Math.PI / 2 },
     false,
@@ -952,6 +953,118 @@ test('menu mode: keys delegated to onMenuKey', () => {
   handler.setMode('menu');
   handler.handleKey('f', { name: 'f' });
   assertEqual(receivedKey, 'f', 'Menu key should be delegated');
+});
+
+// ─── Quaternion Utilities ─────────────────────────────────────────
+
+test('quatRotateVec3: identity quaternion returns same vector', () => {
+  const [x, y, z] = quatRotateVec3(0, 0, 0, 1, 3, 4, 5);
+  assert(Math.abs(x - 3) < 1e-9 && Math.abs(y - 4) < 1e-9 && Math.abs(z - 5) < 1e-9,
+    `Expected (3,4,5) got (${x},${y},${z})`);
+});
+
+test('quatRotateVec3: 90° around Z rotates X to Y', () => {
+  // 90° around Z: quat = (0, 0, sin(45°), cos(45°))
+  const s = Math.SQRT1_2;
+  const [x, y, z] = quatRotateVec3(0, 0, s, s, 1, 0, 0);
+  assert(Math.abs(x) < 1e-9 && Math.abs(y - 1) < 1e-9 && Math.abs(z) < 1e-9,
+    `Expected (0,1,0) got (${x},${y},${z})`);
+});
+
+test('quatMultiply: identity * q = q', () => {
+  const [x, y, z, w] = quatMultiply(0, 0, 0, 1, 0.1, 0.2, 0.3, 0.9);
+  assert(Math.abs(x - 0.1) < 1e-9 && Math.abs(y - 0.2) < 1e-9 &&
+    Math.abs(z - 0.3) < 1e-9 && Math.abs(w - 0.9) < 1e-9,
+    `Expected (0.1,0.2,0.3,0.9) got (${x},${y},${z},${w})`);
+});
+
+test('quatMultiply: two 90° Z rotations = 180° Z', () => {
+  const s = Math.SQRT1_2;
+  const [qx, qy, qz, qw] = quatMultiply(0, 0, s, s, 0, 0, s, s);
+  // 180° around Z: (0, 0, 1, 0)
+  assert(Math.abs(qx) < 1e-9 && Math.abs(qy) < 1e-9 &&
+    Math.abs(qz - 1) < 1e-9 && Math.abs(qw) < 1e-9,
+    `Expected (0,0,1,0) got (${qx},${qy},${qz},${qw})`);
+});
+
+test('quatRotateVec3 + quatMultiply: composed rotation', () => {
+  // 90° around Z then 90° around X should map (1,0,0) → (0,1,0) → (0,0,1)
+  const s = Math.SQRT1_2;
+  const [cx, cy, cz, cw] = quatMultiply(s, 0, 0, s, 0, 0, s, s);
+  const [rx, ry, rz] = quatRotateVec3(cx, cy, cz, cw, 1, 0, 0);
+  assert(Math.abs(rx) < 1e-9 && Math.abs(ry) < 1e-9 && Math.abs(rz - 1) < 1e-9,
+    `Expected (0,0,1) got (${rx},${ry},${rz})`);
+});
+
+test('projectFirstPerson: many nearby objects renders without crash', () => {
+  const objects: ObjectData[] = [];
+  for (let i = 0; i < 200; i++) {
+    objects.push({
+      uuid: `obj-${i}`, name: `box-${i}`,
+      x: 128 + (i % 10) * 2, y: 128 + Math.floor(i / 10) * 2, z: 25,
+      scaleX: 1, scaleY: 1, scaleZ: 1,
+      isTree: false, pcode: 9, treeSpecies: -1,
+      pathCurve: 16, profileCurve: 1,
+      rotX: 0, rotY: 0, rotZ: 0, rotW: 1,
+      colorR: 200, colorG: 150, colorB: 100,
+    });
+  }
+  const frame = projectFirstPerson(
+    () => 25, [], objects,
+    { selfX: 128, selfY: 128, selfZ: 27, yaw: Math.PI / 2, waterHeight: 20, renderMode: 'voxel' },
+    40, 12,
+  );
+  assert(frame.cells.length === 40 * 12, 'Frame size correct');
+});
+
+test('projectFirstPerson: all primitive types render without crash', () => {
+  // Test every SL primitive shape: box, cylinder, sphere, prism, wedge, cone, torus, tube, ring
+  const primTypes: [number, number, string][] = [
+    [16, 1, 'box'],       // linear + square
+    [16, 0, 'cylinder'],  // linear + circle
+    [16, 2, 'prism-iso'], // linear + iso triangle
+    [16, 3, 'prism-eq'],  // linear + equilateral triangle
+    [16, 4, 'wedge'],     // linear + right triangle
+    [16, 5, 'cone'],      // linear + half-circle
+    [32, 5, 'sphere'],    // circular + half-circle
+    [32, 0, 'torus'],     // circular + circle
+    [32, 1, 'tube'],      // circular + square
+    [32, 2, 'ring'],      // circular + triangle
+    [48, 0, 'torus2'],    // circle2 path
+    [16, 0x21, 'cyl+squareHole'], // profile with hole type in upper nibble
+  ];
+  const objects: ObjectData[] = primTypes.map(([pathCurve, profileCurve, name], i) => ({
+    uuid: `prim-${name}`, name,
+    x: 128 + i * 3, y: 132, z: 25,
+    scaleX: 2, scaleY: 2, scaleZ: 2,
+    isTree: false, pcode: 9, treeSpecies: -1,
+    pathCurve, profileCurve,
+    rotX: 0, rotY: 0, rotZ: 0, rotW: 1,
+    colorR: 180, colorG: 120, colorB: 80,
+  }));
+  const frame = projectFirstPerson(
+    () => 25, [], objects,
+    { selfX: 128, selfY: 128, selfZ: 27, yaw: Math.PI / 2, waterHeight: 20, renderMode: 'voxel' },
+    60, 18,
+  );
+  assert(frame.cells.length === 60 * 18, 'Frame size correct with all prim types');
+});
+
+test('projectFirstPerson: triangle mode with prims renders without crash', () => {
+  const objects: ObjectData[] = [
+    { uuid: 'box1', name: 'box', x: 130, y: 132, z: 25, scaleX: 3, scaleY: 3, scaleZ: 3,
+      isTree: false, pcode: 9, treeSpecies: -1, pathCurve: 16, profileCurve: 1,
+      rotX: 0, rotY: 0, rotZ: 0, rotW: 1, colorR: 200, colorG: 100, colorB: 50 },
+    { uuid: 'torus1', name: 'torus', x: 134, y: 132, z: 25, scaleX: 2, scaleY: 2, scaleZ: 2,
+      isTree: false, pcode: 9, treeSpecies: -1, pathCurve: 32, profileCurve: 0,
+      rotX: 0, rotY: 0, rotZ: 0, rotW: 1, colorR: 100, colorG: 200, colorB: 50 },
+  ];
+  const frame = projectFirstPerson(
+    () => 25, [], objects,
+    { selfX: 128, selfY: 128, selfZ: 27, yaw: Math.PI / 2, waterHeight: 20, renderMode: 'triangle' },
+    40, 12,
+  );
+  assert(frame.cells.length === 40 * 12, 'Frame renders in triangle mode');
 });
 
 // ─── Report ──────────────────────────────────────────────────────

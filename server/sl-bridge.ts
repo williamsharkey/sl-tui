@@ -1,5 +1,6 @@
 // sl-bridge.ts — Wraps Bot: login, movement, events, 4Hz tick loop
 
+import { quatRotateVec3, quatMultiply } from './quat-utils.js';
 import { Bot } from '../vendor/node-metaverse/Bot.js';
 import { LoginParameters } from '../vendor/node-metaverse/classes/LoginParameters.js';
 import { BotOptionFlags } from '../vendor/node-metaverse/enums/BotOptionFlags.js';
@@ -225,8 +226,10 @@ export class SLBridge {
         this._displayPos.z += mz * dt;
       }
 
-      // Also lerp toward server position to correct drift
-      const correctionSpeed = this._activeMove ? 2 : 5; // slower correction while moving
+      // Lerp toward server position to correct drift
+      // While actively moving, dead reckoning dominates — only gently correct
+      // When stopped, snap quickly to server truth
+      const correctionSpeed = this._activeMove ? 0.3 : 8;
       const t = 1 - Math.exp(-correctionSpeed * dt);
       this._displayPos.x += (this._serverPos.x - this._displayPos.x) * t;
       this._displayPos.y += (this._serverPos.y - this._displayPos.y) * t;
@@ -374,6 +377,16 @@ export class SLBridge {
         2 * (rot.w * rot.z + rot.x * rot.y),
         1 - 2 * (rot.y * rot.y + rot.z * rot.z)
       );
+      // Extract velocity from the underlying GameObject
+      let velX = 0, velY = 0, velZ = 0;
+      try {
+        const go = (avatar as any).gameObject ?? (avatar as any).GameObject;
+        if (go?.Velocity) {
+          velX = go.Velocity.x ?? 0;
+          velY = go.Velocity.y ?? 0;
+          velZ = go.Velocity.z ?? 0;
+        }
+      } catch { /* no velocity data */ }
       result.push({
         uuid,
         firstName: avatar.firstName,
@@ -383,6 +396,7 @@ export class SLBridge {
         z: pos.z,
         yaw,
         isSelf: uuid === this._selfId,
+        velX, velY, velZ,
       });
     }
     return result;
@@ -400,21 +414,75 @@ export class SLBridge {
     try {
       const objs = this.bot.currentRegion.objects.getAllObjects({});
       const result: ObjectData[] = [];
-      for (const obj of objs) {
-        if (!obj.Position) continue;
-        if (obj.ParentID && obj.ParentID !== 0) continue;
-        const scale = obj.Scale || { x: 1, y: 1, z: 1 };
-        result.push({
-          uuid: obj.FullID?.toString() ?? '',
-          name: obj.name || '',
-          x: obj.Position.x,
-          y: obj.Position.y,
-          z: obj.Position.z,
+
+      const primToObjectData = (
+        prim: any,
+        worldX: number, worldY: number, worldZ: number,
+        worldRotX: number, worldRotY: number, worldRotZ: number, worldRotW: number,
+      ): ObjectData => {
+        const scale = prim.Scale || { x: 1, y: 1, z: 1 };
+        let colorR = 128, colorG = 128, colorB = 128;
+        try {
+          const te = prim.TextureEntry;
+          if (te?.defaultTexture?.rgba) {
+            const rgba = te.defaultTexture.rgba;
+            colorR = Math.round((rgba.r ?? rgba.x ?? 0.5) * 255);
+            colorG = Math.round((rgba.g ?? rgba.y ?? 0.5) * 255);
+            colorB = Math.round((rgba.b ?? rgba.z ?? 0.5) * 255);
+          }
+        } catch { /* keep defaults */ }
+        return {
+          uuid: prim.FullID?.toString() ?? '',
+          name: prim.name || '',
+          x: worldX,
+          y: worldY,
+          z: worldZ,
           scaleX: scale.x,
           scaleY: scale.y,
           scaleZ: scale.z,
-          isTree: obj.PCode === 255 || obj.PCode === 111 || obj.PCode === 95,
-        });
+          isTree: prim.PCode === 255 || prim.PCode === 111 || prim.PCode === 95,
+          pcode: prim.PCode ?? 9,
+          treeSpecies: prim.TreeSpecies ?? -1,
+          pathCurve: prim.PathCurve ?? 16,
+          profileCurve: prim.ProfileCurve ?? 1,
+          rotX: worldRotX, rotY: worldRotY, rotZ: worldRotZ, rotW: worldRotW,
+          colorR, colorG, colorB,
+        };
+      };
+
+      for (const obj of objs) {
+        if (!obj.Position) continue;
+        const rot = obj.Rotation || { x: 0, y: 0, z: 0, w: 1 };
+        const rootData = primToObjectData(
+          obj, obj.Position.x, obj.Position.y, obj.Position.z,
+          rot.x, rot.y, rot.z, rot.w,
+        );
+        result.push(rootData);
+
+        // Flatten child prims (linkset members) — skip for trees/grass
+        if (!rootData.isTree && obj.children && obj.children.length > 0) {
+          for (const child of obj.children) {
+            if (!child.Position) continue;
+            // Child Position/Rotation are LOCAL to the root prim
+            const childLocalPos = child.Position;
+            const childRot = child.Rotation || { x: 0, y: 0, z: 0, w: 1 };
+            // World position = parentPos + parentRot * childLocalPos
+            const [wx, wy, wz] = quatRotateVec3(
+              rot.x, rot.y, rot.z, rot.w,
+              childLocalPos.x, childLocalPos.y, childLocalPos.z,
+            );
+            // World rotation = parentRot * childRot
+            const [crx, cry, crz, crw] = quatMultiply(
+              rot.x, rot.y, rot.z, rot.w,
+              childRot.x, childRot.y, childRot.z, childRot.w,
+            );
+            result.push(primToObjectData(
+              child,
+              obj.Position.x + wx, obj.Position.y + wy, obj.Position.z + wz,
+              crx, cry, crz, crw,
+            ));
+          }
+        }
       }
       this._objectCache = result;
       this._objectCacheAge = now;

@@ -1,0 +1,10 @@
+test/
+src/
+dist/
+.claude/
+.DS_Store
+*.js.map
+tsconfig.json
+CLAUDE.md
+sl-tui
+src/**/*.o

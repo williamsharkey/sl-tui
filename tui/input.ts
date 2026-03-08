@@ -10,6 +10,7 @@ export interface InputCallbacks {
   onStop: () => void;
   onToggleFly: () => void;
   onToggleDither: () => void;
+  onToggleRenderMode: () => void;
   onTurnLeft: () => void;
   onTurnRight: () => void;
   onEnterChat: () => void;
@@ -134,6 +135,8 @@ export class InputHandler {
       this.callbacks.onToggleFly();
     } else if (str === 'v' || str === 'V') {
       this.callbacks.onToggleDither();
+    } else if (str === 'r' || str === 'R') {
+      this.callbacks.onToggleRenderMode();
     } else if (key.name === 'return') {
       this.callbacks.onEnterChat();
     } else if (str === '/' || key.name === 'tab') {

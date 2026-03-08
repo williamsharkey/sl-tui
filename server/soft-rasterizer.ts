@@ -8,6 +8,7 @@ export interface RasterTarget {
   height: number;
   color: Uint8Array;   // RGBA, length = width * height * 4
   depth: Float32Array;  // per-pixel depth, length = width * height
+  oids?: (string | undefined)[];  // optional per-pixel object ID
 }
 
 export function createRasterTarget(width: number, height: number): RasterTarget {
@@ -83,6 +84,37 @@ export function mat4ModelPosScale(out: Float32Array, px: number, py: number, pz:
   out[15] = 1;
 }
 
+// Build a model matrix: M = T * R * S with quaternion rotation and non-uniform scale
+export function mat4ModelPosScaleRot(
+  out: Float32Array,
+  px: number, py: number, pz: number,
+  sx: number, sy: number, sz: number,
+  qx: number, qy: number, qz: number, qw: number,
+): void {
+  // Rotation matrix from quaternion
+  const x2 = qx + qx, y2 = qy + qy, z2 = qz + qz;
+  const xx = qx * x2, xy = qx * y2, xz = qx * z2;
+  const yy = qy * y2, yz = qy * z2, zz = qz * z2;
+  const wx = qw * x2, wy = qw * y2, wz = qw * z2;
+  // R * S (multiply each column of R by scale component)
+  out[0]  = (1 - yy - zz) * sx;
+  out[1]  = (xy + wz) * sx;
+  out[2]  = (xz - wy) * sx;
+  out[3]  = 0;
+  out[4]  = (xy - wz) * sy;
+  out[5]  = (1 - xx - zz) * sy;
+  out[6]  = (yz + wx) * sy;
+  out[7]  = 0;
+  out[8]  = (xz + wy) * sz;
+  out[9]  = (yz - wx) * sz;
+  out[10] = (1 - xx - yy) * sz;
+  out[11] = 0;
+  out[12] = px;
+  out[13] = py;
+  out[14] = pz;
+  out[15] = 1;
+}
+
 // Transform a vertex by MVP, returning NDC (x,y,z,w)
 function transformVertex(
   mvp: Float32Array,
@@ -102,6 +134,7 @@ export function rasterize(
   indices: Uint16Array,
   mvp: Float32Array,         // 4x4 column-major
   baseR: number, baseG: number, baseB: number,
+  oid?: string,
 ): void {
   const { width, height, color, depth } = target;
   const hw = width / 2;
@@ -187,6 +220,7 @@ export function rasterize(
           color[ci + 1] = sg;
           color[ci + 2] = sb;
           color[ci + 3] = 255;
+          if (oid && target.oids) target.oids[idx] = oid;
         }
       }
     }

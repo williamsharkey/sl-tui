@@ -111,15 +111,15 @@ class MockSLBridge implements ISLBridge {
   getAvatars(): AvatarData[] {
     const p = this.pos || { x: 128, y: 128, z: 25 };
     return [
-      { uuid: 'self-uuid-1234', firstName: 'Test', lastName: 'User', x: p.x, y: p.y, z: p.z, yaw: 0, isSelf: true },
-      { uuid: 'other-uuid-5678', firstName: 'Other', lastName: 'Avatar', x: 180, y: 180, z: 25, yaw: 1.57, isSelf: false },
+      { uuid: 'self-uuid-1234', firstName: 'Test', lastName: 'User', x: p.x, y: p.y, z: p.z, yaw: 0, isSelf: true, velX: 0, velY: 0, velZ: 0 },
+      { uuid: 'other-uuid-5678', firstName: 'Other', lastName: 'Avatar', x: 180, y: 180, z: 25, yaw: 1.57, isSelf: false, velX: 0, velY: 0, velZ: 0 },
     ];
   }
 
   getObjects(): ObjectData[] {
     return [
-      { uuid: 'tree-1', name: 'Pine', x: 120, y: 120, z: 25, scaleX: 2, scaleY: 2, scaleZ: 5, isTree: true },
-      { uuid: 'box-1', name: 'Welcome Sign', x: 135, y: 130, z: 25, scaleX: 1, scaleY: 1, scaleZ: 2, isTree: false },
+      { uuid: 'tree-1', name: 'Pine', x: 120, y: 120, z: 25, scaleX: 2, scaleY: 2, scaleZ: 5, isTree: true, pcode: 255, treeSpecies: 0, pathCurve: 16, profileCurve: 1, rotX: 0, rotY: 0, rotZ: 0, rotW: 1, colorR: 51, colorG: 102, colorB: 51 },
+      { uuid: 'box-1', name: 'Welcome Sign', x: 135, y: 130, z: 25, scaleX: 1, scaleY: 1, scaleZ: 2, isTree: false, pcode: 9, treeSpecies: -1, pathCurve: 16, profileCurve: 1, rotX: 0, rotY: 0, rotZ: 0, rotW: 1, colorR: 128, colorG: 128, colorB: 128 },
     ];
   }
 
