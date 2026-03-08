@@ -37,6 +37,8 @@ export interface MenuActions {
   stand: () => void;
   closeMenu: () => void;
   systemMessage: (msg: string) => void;
+  getSettings?: () => { renderMode: string; dither: boolean; flying: boolean; terrainTexture: boolean };
+  toggleSetting?: (key: string) => void;
 }
 
 interface MenuFrame {
@@ -248,6 +250,7 @@ export class MenuPanel {
       case 'teleport':    return this.handleTeleportKey(str);
       case 'tp-input':    return this.handleTpInputKey(str, key);
       case 'actions':     return this.handleActionsKey(str);
+      case 'settings':    return this.handleSettingsKey(str, key);
       case 'profile':     this.pop(); return true;
     }
     return true;
@@ -259,6 +262,7 @@ export class MenuPanel {
     else if (ch === 'm') { this.push({ kind: 'messages' }); this.lastReadTs = Date.now(); }
     else if (ch === 't') { this.push({ kind: 'teleport' }); }
     else if (ch === 'a') { this.push({ kind: 'actions' }); }
+    else if (ch === 's') { this.push({ kind: 'settings' }); }
     return true;
   }
 
@@ -384,6 +388,19 @@ export class MenuPanel {
     return true;
   }
 
+  private handleSettingsKey(str: string | undefined, key: { name?: string }): boolean {
+    const items = ['renderMode', 'dither', 'flying', 'terrainTexture'];
+    const sel = this.handleListNav(str, key, items.length);
+    if (sel !== null) {
+      this.actions.toggleSetting?.(items[sel]);
+    }
+    // Space also toggles
+    if (str === ' ' && items.length > 0) {
+      this.actions.toggleSetting?.(items[this.selectedIdx]);
+    }
+    return true;
+  }
+
   // --- Panel content builders ---
   // Each returns { title, lines, footer } for renderPanel.
 
@@ -398,6 +415,7 @@ export class MenuPanel {
       case 'teleport':     return this.buildTeleport();
       case 'tp-input':     return this.buildTpInput();
       case 'actions':      return this.buildActions();
+      case 'settings':     return this.buildSettings();
       case 'profile':      return this.buildProfile(maxLines);
       default:             return { title: 'Menu', lines: [], footer: ' Esc: close' };
     }
@@ -414,6 +432,7 @@ export class MenuPanel {
         { text: `  [M]  Messages${badge}` },
         { text: '  [T]  Teleport' },
         { text: '  [A]  Actions' },
+        { text: '  [S]  Settings' },
         { text: '' },
       ],
       footer: ' Esc: close',
@@ -554,6 +573,25 @@ export class MenuPanel {
       ],
       footer: ' Esc: back',
     };
+  }
+
+  private buildSettings(): { title: string; lines: PanelLine[]; footer: string } {
+    const settings = this.actions.getSettings?.() ?? { renderMode: 'triangle', dither: false, flying: false, terrainTexture: false };
+    const items = [
+      { label: 'Render mode', value: `[${settings.renderMode} >]` },
+      { label: 'Dither', value: settings.dither ? '[ON]' : '[OFF]' },
+      { label: 'Flying', value: settings.flying ? '[ON]' : '[OFF]' },
+      { label: 'Terrain texture', value: settings.terrainTexture ? '[ON]' : '[OFF]' },
+    ];
+    const lines: PanelLine[] = [{ text: '' }];
+    for (let i = 0; i < items.length; i++) {
+      lines.push({
+        text: `  ${items[i].label}  ${items[i].value}`,
+        selected: i === this.selectedIdx,
+      });
+    }
+    lines.push({ text: '' });
+    return { title: 'Settings', lines, footer: ' Space/Enter:toggle  Esc:back' };
   }
 
   private buildProfile(maxLines: number): { title: string; lines: PanelLine[]; footer: string } {

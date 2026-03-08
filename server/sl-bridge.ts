@@ -422,6 +422,8 @@ export class SLBridge {
       ): ObjectData => {
         const scale = prim.Scale || { x: 1, y: 1, z: 1 };
         let colorR = 128, colorG = 128, colorB = 128;
+        let alpha: number | undefined;
+        let fullbright: boolean | undefined;
         try {
           const te = prim.TextureEntry;
           if (te?.defaultTexture?.rgba) {
@@ -429,7 +431,10 @@ export class SLBridge {
             colorR = Math.round((rgba.r ?? rgba.x ?? 0.5) * 255);
             colorG = Math.round((rgba.g ?? rgba.y ?? 0.5) * 255);
             colorB = Math.round((rgba.b ?? rgba.z ?? 0.5) * 255);
+            const a = rgba.a ?? rgba.w;
+            if (a !== undefined && a < 1) alpha = a;
           }
+          if (te?.defaultTexture?.fullbright) fullbright = true;
         } catch { /* keep defaults */ }
         return {
           uuid: prim.FullID?.toString() ?? '',
@@ -447,6 +452,7 @@ export class SLBridge {
           profileCurve: prim.ProfileCurve ?? 1,
           rotX: worldRotX, rotY: worldRotY, rotZ: worldRotZ, rotW: worldRotW,
           colorR, colorG, colorB,
+          alpha, fullbright,
         };
       };
 

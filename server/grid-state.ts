@@ -120,6 +120,8 @@ export interface ObjectData {
   profileCurve: number; // 0=circle, 1=square, 2=triangle, 5=halfCircle
   rotX: number; rotY: number; rotZ: number; rotW: number;
   colorR: number; colorG: number; colorB: number; // 0-255
+  alpha?: number;       // 0-1, undefined = opaque
+  fullbright?: boolean;
 }
 
 export interface ProjectionParams {
@@ -494,6 +496,68 @@ function waterPixelRGB(height: number, waterHeight: number, wx: number, wy: numb
   ];
 }
 
+// Procedural terrain texture: adds visual detail based on terrain zone
+export function terrainTexturedRGB(height: number, waterHeight: number, wx: number, wy: number): [number, number, number] {
+  let [r, g, b] = terrainRGB(height, waterHeight);
+  const h = height - waterHeight;
+
+  if (h >= 0.3 && h < 3) {
+    // Sand: speckle
+    const speckle = Math.sin(wx * 12.3) * Math.sin(wy * 11.7) * 8;
+    r = Math.max(0, Math.min(255, r + speckle));
+    g = Math.max(0, Math.min(255, g + speckle));
+    b = Math.max(0, Math.min(255, b + speckle));
+  } else if (h >= 3 && h < 25) {
+    // Grass: clumpy noise
+    const noise = Math.sin(wx * 4.3) * Math.cos(wy * 3.7);
+    const variation = noise * 12;
+    const darkPatch = noise < -0.5 ? -15 : 0;
+    r = Math.max(0, Math.min(255, r + variation + darkPatch));
+    g = Math.max(0, Math.min(255, g + variation + darkPatch));
+    b = Math.max(0, Math.min(255, b + variation + darkPatch));
+  } else if (h >= 35 && h < 90) {
+    // Rock: horizontal streaks
+    const streak = Math.sin(wx * 2.1 + wy * 7.8) * 15;
+    r = Math.max(0, Math.min(255, r + streak));
+    g = Math.max(0, Math.min(255, g + streak));
+    b = Math.max(0, Math.min(255, b + streak));
+  } else if (h >= 90) {
+    // Snow: sparkle
+    const sparkle = Math.sin(wx * 20.1) * Math.sin(wy * 19.3) > 0.7 ? 25 : 0;
+    r = Math.max(0, Math.min(255, r + sparkle));
+    g = Math.max(0, Math.min(255, g + sparkle));
+    b = Math.max(0, Math.min(255, b + sparkle));
+  }
+
+  return [r, g, b];
+}
+
+// Avatar color from UUID hash — muted clothing tones
+export function avatarColorFromUUID(uuid: string): [number, number, number] {
+  let hash = 0;
+  for (let i = 0; i < uuid.length; i++) {
+    hash = ((hash << 5) - hash + uuid.charCodeAt(i)) | 0;
+  }
+  const hue = ((hash & 0xFFFF) % 360);
+  // HSL to RGB with S=0.3 L=0.35
+  const s = 0.3, l = 0.35;
+  const c = (1 - Math.abs(2 * l - 1)) * s;
+  const x = c * (1 - Math.abs((hue / 60) % 2 - 1));
+  const m = l - c / 2;
+  let r1 = 0, g1 = 0, b1 = 0;
+  if (hue < 60) { r1 = c; g1 = x; }
+  else if (hue < 120) { r1 = x; g1 = c; }
+  else if (hue < 180) { g1 = c; b1 = x; }
+  else if (hue < 240) { g1 = x; b1 = c; }
+  else if (hue < 300) { r1 = x; b1 = c; }
+  else { r1 = c; b1 = x; }
+  return [
+    Math.round((r1 + m) * 255),
+    Math.round((g1 + m) * 255),
+    Math.round((b1 + m) * 255),
+  ];
+}
+
 // Apply depth fog to RGB
 function fogRGB(r: number, g: number, b: number, depth: number, maxDepth: number, fog?: [number, number, number]): [number, number, number] {
   const t = Math.min(1, depth / maxDepth);
@@ -576,7 +640,7 @@ export interface ChatBubble {
   ts: number; // timestamp when said
 }
 
-export type RenderMode = 'voxel' | 'triangle';
+export type RenderMode = 'voxel' | 'triangle' | 'hybrid';
 
 export interface FirstPersonParams {
   selfX: number;
@@ -589,7 +653,8 @@ export interface FirstPersonParams {
   avatarNames?: Map<string, string>; // uuid → display name
   chatBubbles?: Map<string, ChatBubble>; // uuid → most recent chat
   skyColors?: { zenith: [number, number, number]; horizon: [number, number, number] };
-  renderMode?: RenderMode; // 'voxel' (default) or 'triangle'
+  renderMode?: RenderMode; // 'voxel' (default) or 'triangle' or 'hybrid'
+  terrainTexture?: boolean;
 }
 
 // Shared raster target for avatar mesh rendering — reused across frames
@@ -970,6 +1035,9 @@ function renderTerrainTriangles(
   fogColor: [number, number, number],
   maxDepth: number,
   fov: number,
+  ditherPhase?: number,
+  skipWater?: boolean,
+  terrainTexture?: boolean,
 ): void {
   // Ensure raster target matches FP pixel buffer size
   if (!terrainRasterTarget || terrainRasterTarget.width !== pw || terrainRasterTarget.height !== ph) {
@@ -998,9 +1066,9 @@ function renderTerrainTriangles(
   const FAR_RADIUS = 96;    // 4m cells within 96m
 
   // Generate terrain patches at different LODs
-  renderTerrainPatch(terrainRasterTarget, terrain, vp, selfX, selfY, waterHeight, fogColor, maxDepth, 1, NEAR_RADIUS);
-  renderTerrainPatch(terrainRasterTarget, terrain, vp, selfX, selfY, waterHeight, fogColor, maxDepth, 2, MID_RADIUS);
-  renderTerrainPatch(terrainRasterTarget, terrain, vp, selfX, selfY, waterHeight, fogColor, maxDepth, 4, FAR_RADIUS);
+  renderTerrainPatch(terrainRasterTarget, terrain, vp, selfX, selfY, waterHeight, fogColor, maxDepth, 1, NEAR_RADIUS, ditherPhase, skipWater, terrainTexture);
+  renderTerrainPatch(terrainRasterTarget, terrain, vp, selfX, selfY, waterHeight, fogColor, maxDepth, 2, MID_RADIUS, ditherPhase, skipWater, terrainTexture);
+  renderTerrainPatch(terrainRasterTarget, terrain, vp, selfX, selfY, waterHeight, fogColor, maxDepth, 4, FAR_RADIUS, ditherPhase, skipWater, terrainTexture);
 
   // Copy rasterized terrain into the FP pixel buffer
   for (let py = 0; py < ph; py++) {
@@ -1028,6 +1096,9 @@ function renderTerrainPatch(
   maxDepth: number,
   step: number,
   radius: number,
+  ditherPhase?: number,
+  skipWater?: boolean,
+  terrainTexture?: boolean,
 ): void {
   // Grid centered on camera, snapped to step size
   const cx = Math.floor(selfX / step) * step;
@@ -1058,17 +1129,36 @@ function renderTerrainPatch(
       }
 
       // 4 corners of the cell
-      const x0 = wx, y0 = wy;
+      let x0 = wx, y0 = wy;
       const x1 = Math.min(wx + step, 255), y1 = Math.min(wy + step, 255);
-      const h00 = terrain(x0, y0);
-      const h10 = terrain(x1, y0);
-      const h01 = terrain(x0, y1);
+
+      // Triangle dither: small coordinate offset for subtle animation
+      if (ditherPhase !== undefined) {
+        const dist0 = Math.sqrt((wx - selfX) ** 2 + (wy - selfY) ** 2);
+        const scale = 0.075 * Math.max(0, 1 - dist0 / 30);
+        if (scale > 0.001) {
+          const [ddx, ddy] = ditherNoise(wx * 0.6, wy * 0.6, ditherPhase);
+          x0 += ddx * scale;
+          y0 += ddy * scale;
+        }
+      }
+
+      const h00 = terrain(Math.min(255, Math.max(0, Math.floor(x0))), Math.min(255, Math.max(0, Math.floor(y0))));
+      const h10 = terrain(x1, Math.min(255, Math.max(0, Math.floor(y0))));
+      const h01 = terrain(Math.min(255, Math.max(0, Math.floor(x0))), y1);
       const h11 = terrain(x1, y1);
 
       // Average height for coloring
       const hAvg = (h00 + h10 + h01 + h11) / 4;
+
+      // Skip water cells in hybrid mode
+      if (skipWater && hAvg < waterHeight) continue;
+
       const dist = Math.sqrt((wx + step / 2 - selfX) ** 2 + (wy + step / 2 - selfY) ** 2);
-      let [r, g, b] = terrainRGB(hAvg, waterHeight);
+      const centerWx = wx + step / 2, centerWy = wy + step / 2;
+      let [r, g, b] = terrainTexture
+        ? terrainTexturedRGB(hAvg, waterHeight, centerWx, centerWy)
+        : terrainRGB(hAvg, waterHeight);
       // Water surface tint
       if (hAvg < waterHeight) {
         [r, g, b] = [0x44, 0x88, 0xbb];
@@ -1092,6 +1182,85 @@ function renderTerrainPatch(
   }
 }
 
+// Voxel water renderer for hybrid mode — only draws water surface
+function renderVoxelWater(
+  buf: FPPixelBuffer, pw: number, ph: number,
+  terrain: (x: number, y: number) => number,
+  selfX: number, selfY: number, selfZ: number, yaw: number,
+  waterHeight: number,
+  fogColor: [number, number, number],
+  maxDepth: number,
+  fov: number,
+  horizon: number,
+  ditherPhase: number,
+  terrainTexture?: boolean,
+): void {
+  const HALF_FOV = fov / 2;
+  const NEAR = 1;
+  const CAMERA_HEIGHT = selfZ;
+
+  for (let pcol = 0; pcol < pw; pcol++) {
+    const screenFrac = pcol / (pw - 1);
+    const rayAngle = yaw + HALF_FOV - screenFrac * fov;
+    const rayDirX = Math.cos(rayAngle);
+    const rayDirY = Math.sin(rayAngle);
+    const cosCorrection = Math.cos(rayAngle - yaw);
+
+    let depth = NEAR;
+    while (depth < maxDepth) {
+      const wx = selfX + rayDirX * depth;
+      const wy = selfY + rayDirY * depth;
+
+      if (wx >= 0 && wx < 256 && wy >= 0 && wy < 256) {
+        const ix = Math.floor(wx), iy = Math.floor(wy);
+        const fx = wx - ix, fy = wy - iy;
+        const ix1 = Math.min(ix + 1, 255), iy1 = Math.min(iy + 1, 255);
+        const h00 = terrain(ix, iy), h10 = terrain(ix1, iy);
+        const h01 = terrain(ix, iy1), h11 = terrain(ix1, iy1);
+        const h = h00 * (1 - fx) * (1 - fy) + h10 * fx * (1 - fy)
+                + h01 * (1 - fx) * fy + h11 * fx * fy;
+
+        // Only draw water pixels
+        if (h < waterHeight) {
+          const correctedDepth = depth * cosCorrection;
+          const heightOnScreen = ((CAMERA_HEIGHT - waterHeight) / correctedDepth) * ph;
+          const screenPy = Math.round(horizon + heightOnScreen);
+
+          if (screenPy >= 0 && screenPy < ph) {
+            // Check depth buffer — only write if closer
+            const existingDepth = buf.depth[screenPy * pw + pcol];
+            if (correctedDepth < existingDepth) {
+              let [wr, wg, wb] = waterPixelRGB(h, waterHeight, wx, wy, depth);
+              [wr, wg, wb] = fogRGB(wr, wg, wb, depth, maxDepth, fogColor);
+              setFPPixel(buf, pcol, screenPy, wr, wg, wb, undefined, correctedDepth);
+
+              // Fill water column below
+              for (let py = screenPy + 1; py < ph; py++) {
+                const exD = buf.depth[py * pw + pcol];
+                if (correctedDepth >= exD) break;
+                setFPPixel(buf, pcol, py, wr, wg, wb, undefined, correctedDepth);
+              }
+            }
+          }
+        }
+      }
+
+      depth += Math.max(0.4, depth * 0.04);
+    }
+  }
+
+  // Horizon line for water continuity
+  if (horizon >= 0 && horizon < ph) {
+    const skyHorizon = fogColor;
+    for (let pcol = 0; pcol < pw; pcol++) {
+      const idx = horizon * pw + pcol;
+      if (buf.depth[idx] === Infinity) {
+        setFPPixel(buf, pcol, horizon, skyHorizon[0], skyHorizon[1], skyHorizon[2]);
+      }
+    }
+  }
+}
+
 export function projectFirstPerson(
   terrain: (x: number, y: number) => number,
   avatars: AvatarData[],
@@ -1100,8 +1269,8 @@ export function projectFirstPerson(
   cols: number,
   rows: number,
 ): GridFrame {
-  const { selfX, selfY, selfZ, yaw, waterHeight, ditherPhase, skyColors, renderMode } = params;
-  const useTriangles = renderMode === 'triangle';
+  const { selfX, selfY, selfZ, yaw, waterHeight, ditherPhase, skyColors, renderMode, terrainTexture } = params;
+  const useTriangles = renderMode !== 'voxel';
   const dither = ditherPhase !== undefined && ditherPhase > 0;
 
   // Sky colors from region environment, or defaults
@@ -1131,8 +1300,14 @@ export function projectFirstPerson(
 
   if (useTriangles) {
     // ─── Triangle-based terrain rendering ───────────────────────────
-    // Build a mesh grid around the camera and rasterize it as triangles
-    renderTerrainTriangles(buf, pw, ph, terrain, selfX, selfY, selfZ, yaw, waterHeight, fogColor, MAX_DEPTH, FOV);
+    const triDither = dither ? ditherPhase : undefined;
+    const isHybrid = renderMode === 'hybrid';
+    renderTerrainTriangles(buf, pw, ph, terrain, selfX, selfY, selfZ, yaw, waterHeight, fogColor, MAX_DEPTH, FOV, triDither, isHybrid, terrainTexture);
+
+    if (isHybrid) {
+      // Voxel water overlay for hybrid mode
+      renderVoxelWater(buf, pw, ph, terrain, selfX, selfY, selfZ, yaw, waterHeight, fogColor, MAX_DEPTH, FOV, HORIZON, dither ? ditherPhase! : 0, terrainTexture);
+    }
   } else {
     // ─── Comanche-style voxel space raycasting ───────────────────────
 
@@ -1191,7 +1366,7 @@ export function projectFirstPerson(
 
             let [tr, tg, tb] = (h < waterHeight)
               ? waterPixelRGB(h, waterHeight, sampleX, sampleY, depth)
-              : terrainRGB(h, waterHeight);
+              : (terrainTexture ? terrainTexturedRGB(h, waterHeight, sampleX, sampleY) : terrainRGB(h, waterHeight));
 
             if (h >= waterHeight) {
               const gx = h10 - h00;
@@ -1299,6 +1474,8 @@ export function projectFirstPerson(
   clearObjFullTarget(objTarget);
 
   for (const { obj, dist: forwardDist } of nearObjects) {
+    // Skip nearly transparent objects
+    if (obj.alpha !== undefined && obj.alpha < 0.1) continue;
     const geo = getUnitGeometry(obj.pathCurve, obj.profileCurve);
     mat4ModelPosScaleRot(
       objModel,
@@ -1308,8 +1485,14 @@ export function projectFirstPerson(
     );
     mat4Multiply(objMV, objView, objModel);
     mat4Multiply(objMVP, objProj, objMV);
-    const [fr, fg, fb] = fogRGB(obj.colorR, obj.colorG, obj.colorB, forwardDist, MAX_DEPTH, fogColor);
-    rasterize(objTarget, geo.positions, geo.indices, objMVP, fr, fg, fb, obj.uuid);
+    let [fr, fg, fb] = fogRGB(obj.colorR, obj.colorG, obj.colorB, forwardDist, MAX_DEPTH, fogColor);
+    // Apply partial alpha
+    if (obj.alpha !== undefined && obj.alpha < 1) {
+      fr = Math.round(fr * obj.alpha);
+      fg = Math.round(fg * obj.alpha);
+      fb = Math.round(fb * obj.alpha);
+    }
+    rasterize(objTarget, geo.positions, geo.indices, objMVP, fr, fg, fb, obj.uuid, obj.fullbright);
   }
 
   // Copy rasterized object pixels to FP buffer with depth conversion
@@ -1330,6 +1513,7 @@ export function projectFirstPerson(
   // Far/tree objects: tinted rectangles
   for (const { obj, dist: forwardDist } of sortedObjects) {
     if (nearSet.has(obj.uuid)) continue;
+    if (obj.alpha !== undefined && obj.alpha < 0.1) continue;
     {
       const proj = worldToScreen(obj.x, obj.y, obj.z + obj.scaleZ / 2);
       if (!proj) continue;
@@ -1404,7 +1588,8 @@ export function projectFirstPerson(
     }
 
     if (!rendered) {
-      const [ar, ag, ab] = fogRGB(0x30, 0x30, 0x30, forwardDist, MAX_DEPTH, fogColor);
+      const avBaseColor = avatarColorFromUUID(av.uuid);
+      const [ar, ag, ab] = fogRGB(avBaseColor[0], avBaseColor[1], avBaseColor[2], forwardDist, MAX_DEPTH, fogColor);
       const velMag = Math.sqrt(av.velX * av.velX + av.velY * av.velY + av.velZ * av.velZ);
       renderPixelAvatar(buf, pw, ph, screenPx, headPy, figH, ar, ag, ab, av.uuid, forwardDist, velMag);
     }
@@ -1746,8 +1931,12 @@ function renderMeshToPixels(
   mat4Multiply(mv, view, model);
   mat4Multiply(mvp, proj, mv);
 
+  const meshColor = avatarColorFromUUID(uuid);
+  const mr = Math.min(255, meshColor[0] + 80);
+  const mg = Math.min(255, meshColor[1] + 60);
+  const mb = Math.min(255, meshColor[2] + 40);
   for (const mesh of bundle.meshes) {
-    rasterize(target, mesh.positions, mesh.indices, mvp, 180, 160, 140);
+    rasterize(target, mesh.positions, mesh.indices, mvp, mr, mg, mb);
   }
 
   // Check if anything was drawn

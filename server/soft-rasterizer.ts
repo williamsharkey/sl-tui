@@ -135,6 +135,7 @@ export function rasterize(
   mvp: Float32Array,         // 4x4 column-major
   baseR: number, baseG: number, baseB: number,
   oid?: string,
+  fullbright?: boolean,
 ): void {
   const { width, height, color, depth } = target;
   const hw = width / 2;
@@ -171,7 +172,7 @@ export function rasterize(
     // Directional light from upper-left-forward
     const lightDot = Math.max(0, nx * -0.4 + ny * 0.3 + nz * 0.7);
     const ambient = 0.35;
-    const faceShade = ambient + (1 - ambient) * lightDot;
+    const faceShade = fullbright ? 1.0 : ambient + (1 - ambient) * lightDot;
 
     // Screen coordinates
     const sx0 = (x0 + 1) * hw, sy0 = (1 - y0) * hh;

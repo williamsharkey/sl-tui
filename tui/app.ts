@@ -48,9 +48,10 @@ export class TUIApp {
   private lastStatusStr = '';
   private ditherEnabled = false;
   private ditherPhase = 0;
-  private renderMode: RenderMode = 'voxel';
+  private renderMode: RenderMode = 'triangle';
   private chatBubbles = new Map<string, ChatBubble>();
   private menu: MenuPanel;
+  private terrainTexture = false;
   private autoLogin?: { firstName: string; lastName: string; password: string };
   private createBridge?: () => ISLBridge;
   private onLoginSuccess?: (firstName: string, lastName: string, password: string) => void;
@@ -95,6 +96,33 @@ export class TUIApp {
       stand: () => { this.bridge.stand(); },
       closeMenu: () => { this.closeMenu(); },
       systemMessage: (msg) => { this.chatBuffer.addSystem(msg); this.renderChat(); },
+      getSettings: () => ({
+        renderMode: this.renderMode,
+        dither: this.ditherEnabled,
+        flying: this.bridge.flying,
+        terrainTexture: this.terrainTexture,
+      }),
+      toggleSetting: (key: string) => {
+        if (key === 'renderMode') {
+          const modes: RenderMode[] = ['triangle', 'hybrid', 'voxel'];
+          const idx = modes.indexOf(this.renderMode);
+          this.renderMode = modes[(idx + 1) % modes.length];
+          this.prevFpFrame = null;
+          this.chatBuffer.addSystem(`Render: ${this.renderMode}`);
+        } else if (key === 'dither') {
+          this.ditherEnabled = !this.ditherEnabled;
+          if (!this.ditherEnabled) this.ditherPhase = 0;
+          this.chatBuffer.addSystem(`Dither ${this.ditherEnabled ? 'ON' : 'OFF'}`);
+        } else if (key === 'flying') {
+          this.bridge.setFlying(!this.bridge.flying);
+          this.chatBuffer.addSystem(`Flying ${this.bridge.flying ? 'ON' : 'OFF'}`);
+        } else if (key === 'terrainTexture') {
+          this.terrainTexture = !this.terrainTexture;
+          this.prevFpFrame = null;
+          this.chatBuffer.addSystem(`Terrain texture ${this.terrainTexture ? 'ON' : 'OFF'}`);
+        }
+        this.renderChat();
+      },
     });
 
     this.inputHandler = new InputHandler({
@@ -109,7 +137,9 @@ export class TUIApp {
         this.renderChat();
       },
       onToggleRenderMode: () => {
-        this.renderMode = this.renderMode === 'voxel' ? 'triangle' : 'voxel';
+        const modes: RenderMode[] = ['triangle', 'hybrid', 'voxel'];
+        const idx = modes.indexOf(this.renderMode);
+        this.renderMode = modes[(idx + 1) % modes.length];
         this.prevFpFrame = null; // force full redraw
         this.chatBuffer.addSystem(`Render: ${this.renderMode}`);
         this.renderChat();
@@ -336,7 +366,8 @@ export class TUIApp {
           avatarNames: avatarNameMap,
           chatBubbles: this.chatBubbles,
           skyColors: this.bridge.getSkyColors() ?? undefined,
-          renderMode: this.renderMode },
+          renderMode: this.renderMode,
+          terrainTexture: this.terrainTexture },
         this.layout.fpCols,
         this.layout.fpRows,
       );

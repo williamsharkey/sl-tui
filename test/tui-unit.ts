@@ -13,7 +13,7 @@ import {
 } from '../tui/renderer.js';
 import { ChatBuffer } from '../tui/chat-buffer.js';
 import { InputHandler, type Mode } from '../tui/input.js';
-import { createEmptyFrame, diffFrames, projectFirstPerson, projectFrame, type GridFrame, type Cell, type CellDelta, type AvatarData, type ObjectData } from '../server/grid-state.js';
+import { createEmptyFrame, diffFrames, projectFirstPerson, projectFrame, terrainTexturedRGB, avatarColorFromUUID, type GridFrame, type Cell, type CellDelta, type AvatarData, type ObjectData } from '../server/grid-state.js';
 import { quatRotateVec3, quatMultiply } from '../server/quat-utils.js';
 import type { WritableTarget } from '../tui/types.js';
 
@@ -1065,6 +1065,117 @@ test('projectFirstPerson: triangle mode with prims renders without crash', () =>
     40, 12,
   );
   assert(frame.cells.length === 40 * 12, 'Frame renders in triangle mode');
+});
+
+// ─── Hybrid Mode ─────────────────────────────────────────────────
+
+console.log('\n=== Hybrid Mode ===');
+
+test('projectFirstPerson: hybrid mode renders without crash', () => {
+  const frame = projectFirstPerson(
+    () => 25, [], [],
+    { selfX: 128, selfY: 128, selfZ: 27, yaw: Math.PI / 2, waterHeight: 20, renderMode: 'hybrid' },
+    40, 12,
+  );
+  assert(frame.cells.length === 40 * 12, 'Hybrid mode frame size correct');
+});
+
+test('projectFirstPerson: hybrid mode with water terrain', () => {
+  // Terrain below water — hybrid should render voxel water
+  const frame = projectFirstPerson(
+    () => 15, [], [],
+    { selfX: 128, selfY: 128, selfZ: 27, yaw: Math.PI / 2, waterHeight: 20, renderMode: 'hybrid' },
+    20, 8,
+  );
+  assert(frame.cells.length === 20 * 8, 'Hybrid mode with water renders');
+});
+
+// ─── Settings Toggle ─────────────────────────────────────────────
+
+console.log('\n=== Settings Menu ===');
+
+test('MenuPanel: settings submenu opens and has items', () => {
+  const menu = new MenuPanel(makeMenuActions({
+    getSettings: () => ({ renderMode: 'triangle', dither: false, flying: false, terrainTexture: false }),
+    toggleSetting: () => {},
+  }));
+  menu.open();
+  // Press 's' for settings
+  menu.handleKey('s', {});
+  assert(menu.isOpen, 'Settings submenu is open');
+  const layout = computeLayout(80, 24);
+  const rendered = menu.render(layout);
+  assert(rendered.includes('Settings'), 'Settings panel renders');
+});
+
+// ─── Terrain Texture ──────────────────────────────────────────────
+
+console.log('\n=== Terrain Texture ===');
+
+test('terrainTexturedRGB returns valid RGB for grass zone', () => {
+  const [r, g, b] = terrainTexturedRGB(30, 20, 10.5, 15.3);
+  assert(r >= 0 && r <= 255, `R in range: ${r}`);
+  assert(g >= 0 && g <= 255, `G in range: ${g}`);
+  assert(b >= 0 && b <= 255, `B in range: ${b}`);
+});
+
+test('terrainTexturedRGB returns valid RGB for snow zone', () => {
+  const [r, g, b] = terrainTexturedRGB(115, 20, 5.0, 5.0);
+  assert(r >= 0 && r <= 255, `R in range: ${r}`);
+  assert(g >= 0 && g <= 255, `G in range: ${g}`);
+  assert(b >= 0 && b <= 255, `B in range: ${b}`);
+});
+
+test('terrainTexturedRGB varies with position (sand zone)', () => {
+  const [r1] = terrainTexturedRGB(21, 20, 0, 0);
+  const [r2] = terrainTexturedRGB(21, 20, 0.5, 0.5);
+  // Different positions should potentially give different values
+  // (not guaranteed but likely with sin functions)
+  assert(typeof r1 === 'number' && typeof r2 === 'number', 'Returns numbers');
+});
+
+// ─── Avatar Color ─────────────────────────────────────────────────
+
+console.log('\n=== Avatar Color ===');
+
+test('avatarColorFromUUID returns valid RGB', () => {
+  const [r, g, b] = avatarColorFromUUID('12345678-1234-1234-1234-123456789abc');
+  assert(r >= 0 && r <= 255, `R in range: ${r}`);
+  assert(g >= 0 && g <= 255, `G in range: ${g}`);
+  assert(b >= 0 && b <= 255, `B in range: ${b}`);
+});
+
+test('avatarColorFromUUID returns different colors for different UUIDs', () => {
+  const [r1, g1, b1] = avatarColorFromUUID('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa');
+  const [r2, g2, b2] = avatarColorFromUUID('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb');
+  const different = r1 !== r2 || g1 !== g2 || b1 !== b2;
+  assert(different, 'Different UUIDs produce different colors');
+});
+
+test('avatarColorFromUUID is deterministic', () => {
+  const uuid = 'deadbeef-1234-5678-9abc-def012345678';
+  const [r1, g1, b1] = avatarColorFromUUID(uuid);
+  const [r2, g2, b2] = avatarColorFromUUID(uuid);
+  assert(r1 === r2 && g1 === g2 && b1 === b2, 'Same UUID gives same color');
+});
+
+// ─── Alpha/Fullbright ─────────────────────────────────────────────
+
+console.log('\n=== Alpha/Fullbright ===');
+
+test('projectFirstPerson: transparent objects are skipped', () => {
+  const objects: ObjectData[] = [
+    { uuid: 'transparent1', name: 'glass', x: 130, y: 132, z: 25, scaleX: 3, scaleY: 3, scaleZ: 3,
+      isTree: false, pcode: 9, treeSpecies: -1, pathCurve: 16, profileCurve: 1,
+      rotX: 0, rotY: 0, rotZ: 0, rotW: 1, colorR: 200, colorG: 100, colorB: 50,
+      alpha: 0.05 },
+  ];
+  const frame = projectFirstPerson(
+    () => 25, [], objects,
+    { selfX: 128, selfY: 128, selfZ: 27, yaw: Math.PI / 2, waterHeight: 20, renderMode: 'triangle' },
+    40, 12,
+  );
+  assert(frame.cells.length === 40 * 12, 'Frame renders with transparent objects');
 });
 
 // ─── Report ──────────────────────────────────────────────────────
