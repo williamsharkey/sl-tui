@@ -1,12 +1,15 @@
 // grid-state.ts — 3D-to-2D projection, Z-slice, terrain/object/avatar layers, diffing
 
-import type { AvatarMeshBundle } from './avatar-cache.js';
+import type { AvatarMeshBundle, CachedMesh } from './avatar-cache.js';
+import type { AvatarAppearanceData, BakedTextureColors } from './avatar-appearance.js';
 import {
   createRasterTarget, clearRasterTarget, rasterize,
   mat4Multiply, mat4LookAt, mat4Perspective, mat4ModelPosScale,
   mat4ModelPosScaleRot,
 } from './soft-rasterizer.js';
 import { pixelsToCells } from './pixel-to-cells.js';
+import type { CloudParams } from './cloud-cache.js';
+import { sampleCloudAlpha } from './cloud-cache.js';
 
 export interface Cell {
   char: string;
@@ -29,6 +32,10 @@ export interface GridFrame {
   cells: Cell[];
   cols: number;
   rows: number;
+}
+
+function lerp(a: number, b: number, t: number): number {
+  return a + (b - a) * t;
 }
 
 const BG = '#f0eedc';
@@ -122,6 +129,16 @@ export interface ObjectData {
   colorR: number; colorG: number; colorB: number; // 0-255
   alpha?: number;       // 0-1, undefined = opaque
   fullbright?: boolean;
+  faceColors?: [number, number, number, number][]; // [r,g,b,alpha] per face
+  meshUUID?: string;    // mesh asset UUID from extraParams.meshData
+  // Prim shape modifiers
+  profileHollow?: number;  // 0-1
+  pathBegin?: number;      // 0-1 (cut start)
+  pathEnd?: number;        // 0-1 (cut end)
+  pathTwist?: number;      // radians
+  pathTwistBegin?: number;
+  pathTaperX?: number;     // -1 to 1
+  pathTaperY?: number;
 }
 
 export interface ProjectionParams {
@@ -238,47 +255,38 @@ export function projectFrame(
   const cosY = Math.cos(yaw);
   const sinY = Math.sin(yaw);
 
-  // 1. Terrain layer — sample in rotated screen space
+  // 1. Terrain layer + border overlay — compute world coords once
+  const BORDER_COLOR = '#cc6600';
+  const totalCells = cols * rows;
+  const worldXs = new Float32Array(totalCells);
+  const worldYs = new Float32Array(totalCells);
   for (let row = 0; row < rows; row++) {
+    const sy = (rows / 2 - row) * metersPerCell;
     for (let col = 0; col < cols; col++) {
-      // Screen offset: sx = right, sy = forward (up on screen)
       const sx = (col - cols / 2) * metersPerCell;
-      const sy = (rows / 2 - row) * metersPerCell;
-      // Inverse-rotate back to world coords
-      // sx = dx*sinY - dy*cosY, sy = dx*cosY + dy*sinY
-      const simX = selfX + sx * sinY + sy * cosY;
-      const simY = selfY - sx * cosY + sy * sinY;
+      const idx = row * cols + col;
+      worldXs[idx] = selfX + sx * sinY + sy * cosY;
+      worldYs[idx] = selfY - sx * cosY + sy * sinY;
+      const simX = worldXs[idx], simY = worldYs[idx];
       if (simX >= 0 && simX < 256 && simY >= 0 && simY < 256) {
         const h = terrain(Math.floor(simX), Math.floor(simY));
-        frame.cells[row * cols + col] = terrainCell(h, waterHeight);
+        frame.cells[idx] = terrainCell(h, waterHeight);
       } else {
-        frame.cells[row * cols + col] = { char: ' ', fg: '#333333', bg: BG };
+        frame.cells[idx] = { char: ' ', fg: '#333333', bg: BG };
       }
     }
   }
 
-  // 1b. Sim border overlay — draw border chars where adjacent cell crosses 0 or 256
-  const BORDER_COLOR = '#cc6600';
-  for (let row = 0; row < rows; row++) {
-    for (let col = 0; col < cols; col++) {
-      const sx = (col - cols / 2) * metersPerCell;
-      const sy = (rows / 2 - row) * metersPerCell;
-      const simX = selfX + sx * sinY + sy * cosY;
-      const simY = selfY - sx * cosY + sy * sinY;
-      // Check if this cell is near a sim boundary (within 1 cell width)
-      const nearBorderX = simX < metersPerCell || simX > 256 - metersPerCell;
-      const nearBorderY = simY < metersPerCell || simY > 256 - metersPerCell;
-      if (nearBorderX || nearBorderY) {
-        // Only draw on the in-bounds side
-        if (simX >= 0 && simX < 256 && simY >= 0 && simY < 256) {
-          const idx = row * cols + col;
-          const existing = frame.cells[idx];
-          // Don't overwrite avatars/objects/self
-          if (existing.char !== '@' && existing.char !== '#' && existing.char !== 'T' &&
-              !'^v<>'.includes(existing.char)) {
-            frame.cells[idx] = { char: '│', fg: BORDER_COLOR, bg: BG };
-          }
-        }
+  // 1b. Sim border overlay — reuse cached world coords
+  for (let i = 0; i < totalCells; i++) {
+    const simX = worldXs[i], simY = worldYs[i];
+    const nearBorderX = simX < metersPerCell || simX > 256 - metersPerCell;
+    const nearBorderY = simY < metersPerCell || simY > 256 - metersPerCell;
+    if ((nearBorderX || nearBorderY) && simX >= 0 && simX < 256 && simY >= 0 && simY < 256) {
+      const existing = frame.cells[i];
+      if (existing.char !== '@' && existing.char !== '#' && existing.char !== 'T' &&
+          !'^v<>'.includes(existing.char)) {
+        frame.cells[i] = { char: '│', fg: BORDER_COLOR, bg: BG };
       }
     }
   }
@@ -461,54 +469,86 @@ const TERRAIN_STOPS: [number, number, number, number][] = [
   [120, 0xaa, 0xaa, 0xaa], // snow
 ];
 
-// Smooth lerp between terrain color stops — every unique height gets a unique color
+// Precomputed terrain color LUT: 1 entry per 0.5m from TERRAIN_STOPS min to max
+// Avoids per-pixel linear search through 15 stops
+const TERRAIN_LUT_STEP = 0.5;
+const TERRAIN_LUT_MIN = TERRAIN_STOPS[0][0];
+const TERRAIN_LUT_MAX = TERRAIN_STOPS[TERRAIN_STOPS.length - 1][0];
+const TERRAIN_LUT_SIZE = Math.ceil((TERRAIN_LUT_MAX - TERRAIN_LUT_MIN) / TERRAIN_LUT_STEP) + 1;
+const TERRAIN_LUT_R = new Uint8Array(TERRAIN_LUT_SIZE);
+const TERRAIN_LUT_G = new Uint8Array(TERRAIN_LUT_SIZE);
+const TERRAIN_LUT_B = new Uint8Array(TERRAIN_LUT_SIZE);
+
+function buildTerrainLUT(): void {
+  for (let li = 0; li < TERRAIN_LUT_SIZE; li++) {
+    const h = TERRAIN_LUT_MIN + li * TERRAIN_LUT_STEP;
+    // Find bracketing stops
+    let r: number, g: number, b: number;
+    if (h <= TERRAIN_STOPS[0][0]) {
+      r = TERRAIN_STOPS[0][1]; g = TERRAIN_STOPS[0][2]; b = TERRAIN_STOPS[0][3];
+    } else if (h >= TERRAIN_LUT_MAX) {
+      const last = TERRAIN_STOPS[TERRAIN_STOPS.length - 1];
+      r = last[1]; g = last[2]; b = last[3];
+    } else {
+      r = 0; g = 0; b = 0;
+      for (let i = 0; i < TERRAIN_STOPS.length - 1; i++) {
+        const a = TERRAIN_STOPS[i], bn = TERRAIN_STOPS[i + 1];
+        if (h >= a[0] && h < bn[0]) {
+          const t = (h - a[0]) / (bn[0] - a[0]);
+          r = a[1] + (bn[1] - a[1]) * t + 0.5 | 0;
+          g = a[2] + (bn[2] - a[2]) * t + 0.5 | 0;
+          b = a[3] + (bn[3] - a[3]) * t + 0.5 | 0;
+          break;
+        }
+      }
+    }
+    TERRAIN_LUT_R[li] = r;
+    TERRAIN_LUT_G[li] = g;
+    TERRAIN_LUT_B[li] = b;
+  }
+}
+buildTerrainLUT();
+
+// Reusable tuple to avoid allocation in hot path (caller must consume immediately)
+const _terrainRGBOut: [number, number, number] = [0, 0, 0];
+
+// Smooth lerp between terrain color stops via LUT
 function terrainRGB(height: number, waterHeight: number): [number, number, number] {
   const h = height - waterHeight;
-  // Clamp to range
-  if (h <= TERRAIN_STOPS[0][0]) return [TERRAIN_STOPS[0][1], TERRAIN_STOPS[0][2], TERRAIN_STOPS[0][3]];
-  const last = TERRAIN_STOPS[TERRAIN_STOPS.length - 1];
-  if (h >= last[0]) return [last[1], last[2], last[3]];
-  // Find the two bracketing stops and lerp
-  for (let i = 0; i < TERRAIN_STOPS.length - 1; i++) {
-    const a = TERRAIN_STOPS[i], b = TERRAIN_STOPS[i + 1];
-    if (h >= a[0] && h < b[0]) {
-      const t = (h - a[0]) / (b[0] - a[0]);
-      return [
-        Math.round(a[1] + (b[1] - a[1]) * t),
-        Math.round(a[2] + (b[2] - a[2]) * t),
-        Math.round(a[3] + (b[3] - a[3]) * t),
-      ];
-    }
-  }
-  return [last[1], last[2], last[3]];
+  const fi = (h - TERRAIN_LUT_MIN) / TERRAIN_LUT_STEP;
+  const i0 = Math.max(0, Math.min(TERRAIN_LUT_SIZE - 1, fi | 0));
+  const i1 = Math.min(TERRAIN_LUT_SIZE - 1, i0 + 1);
+  const frac = fi - i0;
+  _terrainRGBOut[0] = TERRAIN_LUT_R[i0] + (TERRAIN_LUT_R[i1] - TERRAIN_LUT_R[i0]) * frac + 0.5 | 0;
+  _terrainRGBOut[1] = TERRAIN_LUT_G[i0] + (TERRAIN_LUT_G[i1] - TERRAIN_LUT_G[i0]) * frac + 0.5 | 0;
+  _terrainRGBOut[2] = TERRAIN_LUT_B[i0] + (TERRAIN_LUT_B[i1] - TERRAIN_LUT_B[i0]) * frac + 0.5 | 0;
+  return _terrainRGBOut;
 }
 
-// Water surface pixel: add wavelet pattern
+// Water surface pixel: add wavelet pattern (reuses _terrainRGBOut)
+const _waterRGBOut: [number, number, number] = [0, 0, 0];
 function waterPixelRGB(height: number, waterHeight: number, wx: number, wy: number, depth: number): [number, number, number] {
   const [br, bg, bb] = terrainRGB(height, waterHeight);
-  // Cheap wave pattern using sin
   const wave = Math.sin(wx * 0.8 + wy * 0.3) * Math.cos(wy * 0.6 - wx * 0.2);
   const highlight = wave > 0.3 ? 30 : wave < -0.3 ? -15 : 0;
-  return [
-    Math.max(0, Math.min(255, br + highlight)),
-    Math.max(0, Math.min(255, bg + highlight)),
-    Math.max(0, Math.min(255, bb + highlight)),
-  ];
+  _waterRGBOut[0] = Math.max(0, Math.min(255, br + highlight));
+  _waterRGBOut[1] = Math.max(0, Math.min(255, bg + highlight));
+  _waterRGBOut[2] = Math.max(0, Math.min(255, bb + highlight));
+  return _waterRGBOut;
 }
 
 // Procedural terrain texture: adds visual detail based on terrain zone
+const _texRGBOut: [number, number, number] = [0, 0, 0];
 export function terrainTexturedRGB(height: number, waterHeight: number, wx: number, wy: number): [number, number, number] {
   let [r, g, b] = terrainRGB(height, waterHeight);
   const h = height - waterHeight;
 
   if (h >= 0.3 && h < 3) {
-    // Sand: speckle
     const speckle = Math.sin(wx * 12.3) * Math.sin(wy * 11.7) * 8;
     r = Math.max(0, Math.min(255, r + speckle));
     g = Math.max(0, Math.min(255, g + speckle));
     b = Math.max(0, Math.min(255, b + speckle));
   } else if (h >= 3 && h < 25) {
-    // Grass: clumpy noise
     const noise = Math.sin(wx * 4.3) * Math.cos(wy * 3.7);
     const variation = noise * 12;
     const darkPatch = noise < -0.5 ? -15 : 0;
@@ -516,20 +556,19 @@ export function terrainTexturedRGB(height: number, waterHeight: number, wx: numb
     g = Math.max(0, Math.min(255, g + variation + darkPatch));
     b = Math.max(0, Math.min(255, b + variation + darkPatch));
   } else if (h >= 35 && h < 90) {
-    // Rock: horizontal streaks
     const streak = Math.sin(wx * 2.1 + wy * 7.8) * 15;
     r = Math.max(0, Math.min(255, r + streak));
     g = Math.max(0, Math.min(255, g + streak));
     b = Math.max(0, Math.min(255, b + streak));
   } else if (h >= 90) {
-    // Snow: sparkle
     const sparkle = Math.sin(wx * 20.1) * Math.sin(wy * 19.3) > 0.7 ? 25 : 0;
     r = Math.max(0, Math.min(255, r + sparkle));
     g = Math.max(0, Math.min(255, g + sparkle));
     b = Math.max(0, Math.min(255, b + sparkle));
   }
 
-  return [r, g, b];
+  _texRGBOut[0] = r; _texRGBOut[1] = g; _texRGBOut[2] = b;
+  return _texRGBOut;
 }
 
 // Avatar color from UUID hash — muted clothing tones
@@ -558,15 +597,15 @@ export function avatarColorFromUUID(uuid: string): [number, number, number] {
   ];
 }
 
-// Apply depth fog to RGB
+// Apply depth fog to RGB (reuses output tuple to reduce GC pressure)
+const _fogRGBOut: [number, number, number] = [0, 0, 0];
 function fogRGB(r: number, g: number, b: number, depth: number, maxDepth: number, fog?: [number, number, number]): [number, number, number] {
   const t = Math.min(1, depth / maxDepth);
   const f = fog ?? FOG_RGB;
-  return [
-    Math.round(r + (f[0] - r) * t),
-    Math.round(g + (f[1] - g) * t),
-    Math.round(b + (f[2] - b) * t),
-  ];
+  _fogRGBOut[0] = r + (f[0] - r) * t + 0.5 | 0;
+  _fogRGBOut[1] = g + (f[1] - g) * t + 0.5 | 0;
+  _fogRGBOut[2] = b + (f[2] - b) * t + 0.5 | 0;
+  return _fogRGBOut;
 }
 
 // Pixel buffer + depth buffer + OID buffer for FP rendering
@@ -599,23 +638,62 @@ function clearFPPixelBuffer(
   horizon?: [number, number, number],
 ): void {
   buf.depth.fill(Infinity);
+  buf.oids.fill(undefined);
   const z = zenith ?? SKY_RGB;
   const h = horizon ?? HORIZON_RGB;
-  const halfH = buf.ph / 2;
-  for (let py = 0; py < buf.ph; py++) {
-    // Gradient: zenith at top → horizon at middle → slightly below for lower sky
-    const t = Math.min(1, py / halfH); // 0 at top, 1 at horizon
-    const sr = Math.round(z[0] + (h[0] - z[0]) * t);
-    const sg = Math.round(z[1] + (h[1] - z[1]) * t);
-    const sb = Math.round(z[2] + (h[2] - z[2]) * t);
-    for (let px = 0; px < buf.pw; px++) {
-      const idx = py * buf.pw + px;
-      const ci = idx * 4;
-      buf.pixels[ci]     = sr;
-      buf.pixels[ci + 1] = sg;
-      buf.pixels[ci + 2] = sb;
-      buf.pixels[ci + 3] = 255;
-      buf.oids[idx] = undefined;
+  const { pw, ph, pixels } = buf;
+  const invHalfH = 2 / ph;
+  for (let py = 0; py < ph; py++) {
+    const t = Math.min(1, py * invHalfH);
+    const sr = z[0] + (h[0] - z[0]) * t + 0.5 | 0;
+    const sg = z[1] + (h[1] - z[1]) * t + 0.5 | 0;
+    const sb = z[2] + (h[2] - z[2]) * t + 0.5 | 0;
+    let ci = py * pw * 4;
+    for (let px = 0; px < pw; px++) {
+      pixels[ci]     = sr;
+      pixels[ci + 1] = sg;
+      pixels[ci + 2] = sb;
+      pixels[ci + 3] = 255;
+      ci += 4;
+    }
+  }
+}
+
+// Render two scrolling cloud layers over sky gradient (SNES-style parallax)
+function renderCloudLayers(buf: FPPixelBuffer, cp: CloudParams, yaw: number, fov: number, time: number): void {
+  const { pw, ph, pixels } = buf;
+  const skyLimit = Math.floor(ph * 0.6); // clouds only in upper 60%
+  const tex = cp.texture;
+
+  for (let py = 0; py < skyLimit; py++) {
+    // Vertical factor: 1.0 at top, 0.0 at sky limit
+    const vFactor = 1.0 - py / (ph * 0.5);
+    // Horizon fade: smoothstep from 0.05 to 0.3
+    const t = Math.max(0, Math.min(1, (vFactor - 0.05) / 0.25));
+    const horizonFade = t * t * (3 - 2 * t);
+
+    for (let px = 0; px < pw; px++) {
+      const uAngle = yaw + (px - pw / 2) * (fov / pw);
+
+      // Layer 1 (far, slow)
+      const u1 = (uAngle * cp.scale + cp.scrollRateX * time * 0.3) % 1.0;
+      const v1 = (vFactor * cp.scale + cp.scrollRateY * time * 0.3) % 1.0;
+      const a1 = sampleCloudAlpha(tex, u1, v1) * cp.density1Z * cp.shadow * horizonFade;
+
+      // Layer 2 (near, fast — parallax offset)
+      const u2 = (uAngle * cp.scale * 0.7 + cp.scrollRateX * time * 0.7) % 1.0;
+      const v2 = (vFactor * cp.scale * 0.7 + cp.scrollRateY * time * 0.7 + 0.37) % 1.0;
+      const a2 = sampleCloudAlpha(tex, u2, v2) * cp.density2Z * cp.shadow * 0.6 * horizonFade;
+
+      // Combined alpha (additive blend of two layers, clamped)
+      const alpha = Math.min(1, a1 + a2);
+      if (alpha < 0.02) continue;
+
+      const ci = (py * pw + px) * 4;
+      // Alpha-blend cloud color over existing sky pixel
+      pixels[ci]     = pixels[ci]     + (cp.colorR - pixels[ci])     * alpha + 0.5 | 0;
+      pixels[ci + 1] = pixels[ci + 1] + (cp.colorG - pixels[ci + 1]) * alpha + 0.5 | 0;
+      pixels[ci + 2] = pixels[ci + 2] + (cp.colorB - pixels[ci + 2]) * alpha + 0.5 | 0;
     }
   }
 }
@@ -648,13 +726,26 @@ export interface FirstPersonParams {
   selfZ: number;  // eye height
   yaw: number;
   waterHeight: number;
+  flying?: boolean;     // enables dynamic pitch and extended draw distance
+  terrainHeight?: number; // terrain height at camera position (for altitude-based pitch)
   ditherPhase?: number; // 0 = off, >0 = animated phase for spatial dither
   meshLookup?: (uuid: string) => AvatarMeshBundle | null;
+  appearanceLookup?: (uuid: string) => AvatarAppearanceData | null;
+  bakedColorsLookup?: (uuid: string) => BakedTextureColors | null;
+  sceneMeshLookup?: (uuid: string) => CachedMesh[] | null;
+  sceneMeshTrigger?: (uuids: string[]) => void;
   avatarNames?: Map<string, string>; // uuid → display name
   chatBubbles?: Map<string, ChatBubble>; // uuid → most recent chat
   skyColors?: { zenith: [number, number, number]; horizon: [number, number, number] };
+  sunDir?: [number, number, number]; // normalized sun light direction for shading
   renderMode?: RenderMode; // 'voxel' (default) or 'triangle' or 'hybrid'
   terrainTexture?: boolean;
+  cameraMode?: 'first-person' | 'third-person'; // third-person = helicopter chase cam
+  cameraOrbitYaw?: number;   // radians offset for orbit camera
+  cameraOrbitPitch?: number; // radians offset for orbit camera
+  selfAvatarPos?: { x: number; y: number; z: number }; // avatar feet position for third-person rendering
+  cloudParams?: CloudParams; // SNES-style parallax cloud layers
+  cloudTime?: number;        // animation time for cloud scrolling
 }
 
 // Shared raster target for avatar mesh rendering — reused across frames
@@ -669,17 +760,12 @@ function getMeshRasterTarget() {
   return meshRasterTarget;
 }
 
-// Spatial noise for dither — high-frequency, low-amplitude textural drift
-function ditherNoise(x: number, y: number, phase: number): [number, number] {
-  // Four octaves of high-frequency sin-based noise, small displacement
-  const s1 = Math.sin(x * 2.8 + phase * 1.3) * Math.cos(y * 3.6 + phase * 0.7);
-  const s2 = Math.sin(y * 2.4 - phase * 1.1) * Math.cos(x * 3.2 - phase * 0.9);
-  const s3 = Math.sin((x + y) * 1.6 + phase * 2.1) * 0.5;
-  const s4 = Math.cos((x - y) * 2.0 + phase * 1.7) * 0.5;
-  return [
-    (s1 + s3) * 0.6, // dx offset in meters (half amplitude)
-    (s2 + s4) * 0.6, // dy offset in meters
-  ];
+// Spatial noise for dither — high-frequency, very low-amplitude vertex wobble
+// Returns ±1 range; caller controls amplitude via scale factor
+function ditherNoise(x: number, y: number, phase: number): number {
+  // High-frequency sin hash — each vertex gets a distinct wobble
+  return Math.sin(x * 7.3 + phase * 1.3) * Math.cos(y * 11.1 + phase * 0.9)
+       + Math.sin((x + y) * 5.7 - phase * 1.7) * 0.5;
 }
 
 // ─── Unit geometry generators (cached) ────────────────────────────
@@ -975,6 +1061,315 @@ function getHemisphereGeometry(): UnitGeometry {
   });
 }
 
+// ─── Face index mapping for per-face colors ──────────────────────
+// Maps triangle index to face index for each geometry type
+
+function boxFaceIndex(triIdx: number): number {
+  return Math.floor(triIdx / 2); // 2 tris per face, 6 faces: bottom,top,front,back,left,right
+}
+
+function cylinderFaceIndex(triIdx: number, segs: number): number {
+  // Bottom cap: 0..segs-1, top cap: segs..2*segs-1, sides: 2*segs..4*segs-1
+  if (triIdx < segs) return 0;       // bottom cap
+  if (triIdx < segs * 2) return 1;   // top cap
+  return 2;                            // sides
+}
+
+function sphereFaceIndex(_triIdx: number): number {
+  return 0; // sphere is one face
+}
+
+function getFaceIndexFn(pathCurve: number, profileCurve: number): ((triIdx: number) => number) | undefined {
+  const profileShape = profileCurve & 0x0F;
+  if (pathCurve === 32 || pathCurve === 48) return sphereFaceIndex;
+  if (profileShape === 1) return boxFaceIndex;
+  if (profileShape === 0) return (triIdx: number) => cylinderFaceIndex(triIdx, 12);
+  return undefined;
+}
+
+// ─── Parameterized geometry (hollow, cut, taper, twist) ──────────
+
+interface ShapeParams {
+  hollow?: number;   // 0-1
+  begin?: number;    // 0-1
+  end?: number;      // 0-1
+  twist?: number;    // radians
+  twistBegin?: number;
+  taperX?: number;   // -1 to 1
+  taperY?: number;
+}
+
+function hasShapeParams(p: ShapeParams): boolean {
+  return (p.hollow != null && p.hollow > 0.01) ||
+         (p.begin != null && p.begin > 0.01) ||
+         (p.end != null && p.end < 0.99) ||
+         (p.twist != null && Math.abs(p.twist) > 0.01) ||
+         (p.taperX != null && Math.abs(p.taperX) > 0.01) ||
+         (p.taperY != null && Math.abs(p.taperY) > 0.01);
+}
+
+// ─── Hollow / Path-cut geometry builders ──────────────────────────
+
+/** Build hollow box geometry: outer shell + inner shell + annular caps */
+function buildHollowBox(hollow: number): UnitGeometry {
+  const inner = 0.5 * (1 - hollow);
+  const o = 0.5; // outer half-extent
+  const verts: number[] = [];
+  const idx: number[] = [];
+
+  // Outer box: 8 verts (0-7), bottom: 0-3, top: 4-7
+  verts.push(-o, -o, -o);  // 0
+  verts.push( o, -o, -o);  // 1
+  verts.push( o,  o, -o);  // 2
+  verts.push(-o,  o, -o);  // 3
+  verts.push(-o, -o,  o);  // 4
+  verts.push( o, -o,  o);  // 5
+  verts.push( o,  o,  o);  // 6
+  verts.push(-o,  o,  o);  // 7
+
+  // Inner box: 8 verts (8-15), same layout but scaled inward on X/Y
+  const n = inner;
+  verts.push(-n, -n, -o);  // 8
+  verts.push( n, -n, -o);  // 9
+  verts.push( n,  n, -o);  // 10
+  verts.push(-n,  n, -o);  // 11
+  verts.push(-n, -n,  o);  // 12
+  verts.push( n, -n,  o);  // 13
+  verts.push( n,  n,  o);  // 14
+  verts.push(-n,  n,  o);  // 15
+
+  // Outer side faces
+  idx.push(0, 5, 1, 0, 4, 5); // front (-Y)
+  idx.push(2, 7, 3, 2, 6, 7); // back (+Y)
+  idx.push(0, 3, 7, 0, 7, 4); // left (-X)
+  idx.push(1, 5, 6, 1, 6, 2); // right (+X)
+
+  // Inner side faces (reversed winding — facing inward)
+  idx.push(8, 9, 13, 8, 13, 12);   // front inner
+  idx.push(10, 11, 15, 10, 15, 14); // back inner
+  idx.push(8, 12, 15, 8, 15, 11);   // left inner
+  idx.push(9, 10, 14, 9, 14, 13);   // right inner
+
+  // Bottom annulus (z = -0.5): outer edge to inner edge
+  idx.push(0, 1, 9, 0, 9, 8);
+  idx.push(1, 2, 10, 1, 10, 9);
+  idx.push(2, 3, 11, 2, 11, 10);
+  idx.push(3, 0, 8, 3, 8, 11);
+
+  // Top annulus (z = 0.5): outer edge to inner edge
+  idx.push(4, 12, 13, 4, 13, 5);
+  idx.push(5, 13, 14, 5, 14, 6);
+  idx.push(6, 14, 15, 6, 15, 7);
+  idx.push(7, 15, 12, 7, 12, 4);
+
+  return { positions: new Float32Array(verts), indices: new Uint16Array(idx) };
+}
+
+/** Build hollow and/or path-cut cylinder geometry */
+function buildHollowCylinder(hollow: number, beginFrac: number, endFrac: number): UnitGeometry {
+  const outerR = 0.5;
+  const innerR = outerR * (1 - hollow);
+  const hasHollow = hollow > 0.01;
+  const hasCut = beginFrac > 0.01 || endFrac < 0.99;
+
+  const theta0 = beginFrac * Math.PI * 2;
+  const theta1 = endFrac * Math.PI * 2;
+  const arcLen = theta1 - theta0;
+
+  // Segment count scaled to arc length
+  const fullSegs = 12;
+  const segs = hasCut ? Math.max(3, Math.ceil(fullSegs * arcLen / (Math.PI * 2))) : fullSegs;
+
+  const verts: number[] = [];
+  const idx: number[] = [];
+
+  // Outer bottom ring: verts [0 .. segs]
+  for (let i = 0; i <= segs; i++) {
+    const a = theta0 + (i / segs) * arcLen;
+    verts.push(Math.cos(a) * outerR, Math.sin(a) * outerR, -0.5);
+  }
+  // Outer top ring: verts [otBase .. otBase+segs]
+  const otBase = segs + 1;
+  for (let i = 0; i <= segs; i++) {
+    const a = theta0 + (i / segs) * arcLen;
+    verts.push(Math.cos(a) * outerR, Math.sin(a) * outerR, 0.5);
+  }
+
+  // Outer wall quads
+  for (let i = 0; i < segs; i++) {
+    const ob0 = i, ob1 = i + 1;
+    const ot0 = otBase + i, ot1 = otBase + i + 1;
+    idx.push(ob0, ob1, ot0);
+    idx.push(ot0, ob1, ot1);
+  }
+
+  if (hasHollow) {
+    // Inner bottom ring
+    const ibBase = verts.length / 3;
+    for (let i = 0; i <= segs; i++) {
+      const a = theta0 + (i / segs) * arcLen;
+      verts.push(Math.cos(a) * innerR, Math.sin(a) * innerR, -0.5);
+    }
+    // Inner top ring
+    const itBase = verts.length / 3;
+    for (let i = 0; i <= segs; i++) {
+      const a = theta0 + (i / segs) * arcLen;
+      verts.push(Math.cos(a) * innerR, Math.sin(a) * innerR, 0.5);
+    }
+
+    // Inner wall (reversed winding)
+    for (let i = 0; i < segs; i++) {
+      const ib0 = ibBase + i, ib1 = ibBase + i + 1;
+      const it0 = itBase + i, it1 = itBase + i + 1;
+      idx.push(ib0, it0, ib1);
+      idx.push(it0, it1, ib1);
+    }
+
+    // Bottom annulus: outer ring to inner ring
+    for (let i = 0; i < segs; i++) {
+      const ob0 = i, ob1 = i + 1;
+      const ib0 = ibBase + i, ib1 = ibBase + i + 1;
+      idx.push(ob0, ib0, ob1);
+      idx.push(ob1, ib0, ib1);
+    }
+
+    // Top annulus: outer ring to inner ring
+    for (let i = 0; i < segs; i++) {
+      const ot0 = otBase + i, ot1 = otBase + i + 1;
+      const it0 = itBase + i, it1 = itBase + i + 1;
+      idx.push(ot0, ot1, it0);
+      idx.push(it0, ot1, it1);
+    }
+
+    // Cut faces at theta0 and theta1 — stitch outer to inner
+    if (hasCut) {
+      idx.push(0, ibBase, itBase);
+      idx.push(0, itBase, otBase);
+
+      const oEnd = segs, otEnd = otBase + segs;
+      const ibEnd = ibBase + segs, itEnd = itBase + segs;
+      idx.push(oEnd, itEnd, ibEnd);
+      idx.push(oEnd, otEnd, itEnd);
+    }
+  } else {
+    // No hollow: solid caps with center vertex
+    const bcIdx = verts.length / 3;
+    verts.push(0, 0, -0.5);
+    const tcIdx = verts.length / 3;
+    verts.push(0, 0, 0.5);
+
+    // Fan caps
+    for (let i = 0; i < segs; i++) {
+      idx.push(bcIdx, i + 1, i);                       // bottom
+      idx.push(tcIdx, otBase + i, otBase + i + 1);     // top
+    }
+
+    if (hasCut) {
+      // Radial cut face at theta0
+      idx.push(bcIdx, 0, otBase);
+      idx.push(bcIdx, otBase, tcIdx);
+      // Radial cut face at theta1
+      idx.push(bcIdx, tcIdx, otBase + segs);
+      idx.push(bcIdx, otBase + segs, segs);
+    }
+  }
+
+  return { positions: new Float32Array(verts), indices: new Uint16Array(idx) };
+}
+
+function getParameterizedGeometry(
+  pathCurve: number, profileCurve: number, params: ShapeParams,
+): UnitGeometry {
+  const profileShape = profileCurve & 0x0F;
+
+  // Only generate parameterized geometry if there are modifiers
+  if (!hasShapeParams(params)) {
+    return getUnitGeometry(pathCurve, profileCurve);
+  }
+
+  // Quantized cache key to prevent cache explosion
+  const hq = Math.round((params.hollow ?? 0) * 20);
+  const bq = Math.round((params.begin ?? 0) * 20);
+  const eq = Math.round((params.end ?? 1) * 20);
+  const twq = Math.round(((params.twist ?? 0) + Math.PI) * 5);
+  const txq = Math.round(((params.taperX ?? 0) + 1) * 10);
+  const tyq = Math.round(((params.taperY ?? 0) + 1) * 10);
+  const key = `p|${pathCurve}|${profileShape}|${hq}|${bq}|${eq}|${twq}|${txq}|${tyq}`;
+
+  return cachedGeo(key, () => {
+    const hollowVal = params.hollow ?? 0;
+    const beginVal = params.begin ?? 0;
+    const endVal = params.end ?? 1;
+    const needsHollow = hollowVal > 0.01;
+    const needsCut = beginVal > 0.01 || endVal < 0.99;
+
+    // Build from scratch for hollow/cut shapes on linear path (pathCurve=16)
+    let positions: Float32Array;
+    let indices: Uint16Array;
+
+    if ((needsHollow || needsCut) && pathCurve === 16) {
+      if (profileShape === 1 && needsHollow && !needsCut) {
+        // Hollow box
+        const geo = buildHollowBox(hollowVal);
+        positions = new Float32Array(geo.positions);
+        indices = new Uint16Array(geo.indices);
+      } else if (profileShape === 0) {
+        // Hollow and/or cut cylinder
+        const geo = buildHollowCylinder(
+          needsHollow ? hollowVal : 0,
+          needsCut ? beginVal : 0,
+          needsCut ? endVal : 1,
+        );
+        positions = new Float32Array(geo.positions);
+        indices = new Uint16Array(geo.indices);
+      } else {
+        // Other shapes: fall back to clone+modify
+        const base = getUnitGeometry(pathCurve, profileCurve);
+        positions = new Float32Array(base.positions);
+        indices = new Uint16Array(base.indices);
+      }
+    } else {
+      // No hollow/cut or non-linear path: clone base geometry
+      const base = getUnitGeometry(pathCurve, profileCurve);
+      positions = new Float32Array(base.positions);
+      indices = new Uint16Array(base.indices);
+    }
+
+    // Apply taper: scale X/Y based on Z position
+    if (params.taperX || params.taperY) {
+      const tx = params.taperX ?? 0;
+      const ty = params.taperY ?? 0;
+      for (let i = 0; i < positions.length; i += 3) {
+        const z = positions[i + 2]; // -0.5 to 0.5
+        const t = z + 0.5; // 0 to 1 (bottom to top)
+        const scaleX = 1 - tx * t;
+        const scaleY = 1 - ty * t;
+        positions[i] *= scaleX;
+        positions[i + 1] *= scaleY;
+      }
+    }
+
+    // Apply twist: rotate X/Y around Z axis proportional to Z position
+    if (params.twist || params.twistBegin) {
+      const twEnd = params.twist ?? 0;
+      const twBegin = params.twistBegin ?? 0;
+      for (let i = 0; i < positions.length; i += 3) {
+        const z = positions[i + 2];
+        const t = z + 0.5; // 0 to 1
+        const angle = twBegin + (twEnd - twBegin) * t;
+        if (Math.abs(angle) > 0.001) {
+          const cosA = Math.cos(angle), sinA = Math.sin(angle);
+          const x = positions[i], y = positions[i + 1];
+          positions[i] = x * cosA - y * sinA;
+          positions[i + 1] = x * sinA + y * cosA;
+        }
+      }
+    }
+
+    return { positions, indices };
+  });
+}
+
 function getUnitGeometry(pathCurve: number, profileCurve: number): UnitGeometry {
   // ProfileCurve encodes ProfileShape in low nibble, HoleType in high nibble
   const profileShape = profileCurve & 0x0F;
@@ -1002,6 +1397,14 @@ function getUnitGeometry(pathCurve: number, profileCurve: number): UnitGeometry 
 // Shared full-size raster target for object rendering (matches FP pixel buffer)
 let objFullTarget: ReturnType<typeof createRasterTarget> | null = null;
 
+// Reusable matrix buffers for object rendering
+const _objView = new Float32Array(16);
+const _objProj = new Float32Array(16);
+const _objModel = new Float32Array(16);
+const _objMV = new Float32Array(16);
+const _objMVP = new Float32Array(16);
+const _wsVP = new Float32Array(16);
+
 function getObjFullTarget(pw: number, ph: number): ReturnType<typeof createRasterTarget> {
   if (!objFullTarget || objFullTarget.width !== pw || objFullTarget.height !== ph) {
     objFullTarget = createRasterTarget(pw, ph);
@@ -1020,12 +1423,20 @@ function ndcDepthToWorldDist(ndcZ: number, near: number, far: number): number {
   return (2 * near * far) / (far + near - ndcZ * (far - near));
 }
 
+/** Convert world distance to NDC depth (inverse of ndcDepthToWorldDist) */
+function worldDistToNdcDepth(dist: number, near: number, far: number): number {
+  return (far + near - 2 * near * far / dist) / (far - near);
+}
+
 // ─── Triangle-based terrain renderer ──────────────────────────────
 // Builds a triangle mesh from terrain heights around the camera and
 // rasterizes it using the soft rasterizer with proper perspective.
 
-// Reusable terrain raster target
+// Reusable terrain raster target and matrix buffers
 let terrainRasterTarget: ReturnType<typeof createRasterTarget> | null = null;
+const _terrainView = new Float32Array(16);
+const _terrainProj = new Float32Array(16);
+const _terrainVP = new Float32Array(16);
 
 function renderTerrainTriangles(
   buf: FPPixelBuffer, pw: number, ph: number,
@@ -1038,6 +1449,7 @@ function renderTerrainTriangles(
   ditherPhase?: number,
   skipWater?: boolean,
   terrainTexture?: boolean,
+  pitch?: number,
 ): void {
   // Ensure raster target matches FP pixel buffer size
   if (!terrainRasterTarget || terrainRasterTarget.width !== pw || terrainRasterTarget.height !== ph) {
@@ -1045,30 +1457,41 @@ function renderTerrainTriangles(
   }
   clearRasterTarget(terrainRasterTarget);
 
-  // Build view + projection matrices
-  const fwdX = Math.cos(yaw), fwdY = Math.sin(yaw);
+  // Build view + projection matrices with pitch
+  const p = pitch ?? 0;
+  const fwdX = Math.cos(yaw) * Math.cos(p), fwdY = Math.sin(yaw) * Math.cos(p);
+  const fwdZ = Math.sin(p); // negative pitch = look down
   const eye = [selfX, selfY, selfZ];
-  const lookAt = [selfX + fwdX * 10, selfY + fwdY * 10, selfZ];
-  const view = new Float32Array(16);
-  mat4LookAt(view, eye, lookAt, [0, 0, 1]);
+  const lookAt = [selfX + fwdX * 10, selfY + fwdY * 10, selfZ + fwdZ * 10];
+  mat4LookAt(_terrainView, eye, lookAt, [0, 0, 1]);
+  // Aspect ratio for perspective: pw/ph treats sextant pixels as square,
+  // but terminal cells are ~1:2 (w:h). Each sextant pixel (cell/2 × cell/3)
+  // is ~0.75:1 in display units, so the vertical extent is taller than
+  // the pixel count implies. We compensate by widening vFov.
   const aspect = pw / ph;
-  const proj = new Float32Array(16);
-  // Use vertical FOV derived from horizontal FOV and aspect ratio
-  const vFov = 2 * Math.atan(Math.tan(fov / 2) / aspect);
-  mat4Perspective(proj, vFov, aspect, 0.5, maxDepth);
-  const vp = new Float32Array(16);
-  mat4Multiply(vp, proj, view);
+  const CELL_RATIO = 0.75; // sextant pixel display width / height
+  const vFov = 2 * Math.atan(Math.tan(fov / 2) / (aspect * CELL_RATIO));
+  mat4Perspective(_terrainProj, vFov, aspect, 0.5, maxDepth);
+  mat4Multiply(_terrainVP, _terrainProj, _terrainView);
 
   // Terrain mesh grid: sample around camera position
-  // Use adaptive LOD: 1m cells near, 2m cells mid, 4m cells far
-  const NEAR_RADIUS = 24;   // 1m cells within 24m
-  const MID_RADIUS = 48;    // 2m cells within 48m
-  const FAR_RADIUS = 96;    // 4m cells within 96m
+  // Use adaptive LOD: 1m cells near, 2m cells mid, 4m cells far, 8m cells ultra-far
+  // When flying high, shift to coarser LOD (detail not visible from altitude)
+  const altScale = Math.max(1, 1 + (Math.max(0, eye[2] - 30)) / 40); // 1 at ground, ~3 at 100m
+  const NEAR_RADIUS = Math.round(24 * Math.min(altScale, 1.5));
+  const MID_RADIUS = Math.round(48 * Math.min(altScale, 2));
+  const FAR_RADIUS = Math.round(Math.min(maxDepth, 96 * altScale));
 
   // Generate terrain patches at different LODs
-  renderTerrainPatch(terrainRasterTarget, terrain, vp, selfX, selfY, waterHeight, fogColor, maxDepth, 1, NEAR_RADIUS, ditherPhase, skipWater, terrainTexture);
-  renderTerrainPatch(terrainRasterTarget, terrain, vp, selfX, selfY, waterHeight, fogColor, maxDepth, 2, MID_RADIUS, ditherPhase, skipWater, terrainTexture);
-  renderTerrainPatch(terrainRasterTarget, terrain, vp, selfX, selfY, waterHeight, fogColor, maxDepth, 4, FAR_RADIUS, ditherPhase, skipWater, terrainTexture);
+  // At altitude, use coarser base step (skip fine detail not visible from above)
+  const baseStep = altScale > 1.5 ? 2 : 1;
+  renderTerrainPatch(terrainRasterTarget, terrain, _terrainVP, selfX, selfY, waterHeight, fogColor, maxDepth, baseStep, NEAR_RADIUS, ditherPhase, skipWater, terrainTexture);
+  renderTerrainPatch(terrainRasterTarget, terrain, _terrainVP, selfX, selfY, waterHeight, fogColor, maxDepth, baseStep * 2, MID_RADIUS, ditherPhase, skipWater, terrainTexture);
+  renderTerrainPatch(terrainRasterTarget, terrain, _terrainVP, selfX, selfY, waterHeight, fogColor, maxDepth, baseStep * 4, FAR_RADIUS, ditherPhase, skipWater, terrainTexture);
+  // Ultra-far ring for high altitude — 8m cells out to max depth
+  if (maxDepth > 96) {
+    renderTerrainPatch(terrainRasterTarget, terrain, _terrainVP, selfX, selfY, waterHeight, fogColor, maxDepth, 8, Math.round(maxDepth), ditherPhase, skipWater, terrainTexture);
+  }
 
   // Copy rasterized terrain into the FP pixel buffer
   for (let py = 0; py < ph; py++) {
@@ -1085,6 +1508,22 @@ function renderTerrainTriangles(
     }
   }
 }
+
+// Vertex smoothing for near-field terrain: average with 4 neighbors
+function smoothedTerrain(terrain: (x: number, y: number) => number, x: number, y: number): number {
+  const ix = Math.min(255, Math.max(0, Math.floor(x)));
+  const iy = Math.min(255, Math.max(0, Math.floor(y)));
+  const h = terrain(ix, iy);
+  const n = terrain(ix, Math.min(255, iy + 1));
+  const s = terrain(ix, Math.max(0, iy - 1));
+  const e = terrain(Math.min(255, ix + 1), iy);
+  const w = terrain(Math.max(0, ix - 1), iy);
+  return h * 0.5 + (n + s + e + w) * 0.125;
+}
+
+// Reusable scratch buffers for terrain patch rendering (avoid per-cell allocation)
+const _patchPositions = new Float32Array(12); // 4 vertices * 3 components
+const _patchIndices = new Uint16Array([0, 1, 2, 1, 3, 2]); // constant quad indices
 
 function renderTerrainPatch(
   target: ReturnType<typeof createRasterTarget>,
@@ -1105,11 +1544,10 @@ function renderTerrainPatch(
   const cy = Math.floor(selfY / step) * step;
   const halfR = Math.floor(radius / step);
 
-  // Identity model matrix (terrain is in world coords)
-  const model = new Float32Array(16);
-  model[0] = 1; model[5] = 1; model[10] = 1; model[15] = 1;
-  const mvp = new Float32Array(16);
-  mat4Multiply(mvp, vp, model);
+  // Terrain is in world coords — vp is the mvp (identity model matrix)
+
+  const innerRadius = step > 1 ? radius * 0.45 : 0;
+  const hasDither = ditherPhase !== undefined;
 
   // Rasterize each terrain cell as 2 triangles
   for (let dy = -halfR; dy < halfR; dy++) {
@@ -1121,40 +1559,45 @@ function renderTerrainPatch(
       if (wx < 0 || wx >= 255 || wy < 0 || wy >= 255) continue;
 
       // Skip cells in inner LOD range (already rendered at higher detail)
-      if (step > 1) {
+      if (innerRadius > 0) {
         const distX = Math.abs(wx + step / 2 - selfX);
         const distY = Math.abs(wy + step / 2 - selfY);
-        const innerRadius = step === 2 ? 24 : 48; // skip if covered by finer LOD
         if (distX < innerRadius && distY < innerRadius) continue;
       }
 
-      // 4 corners of the cell
+      // 4 corners of the cell — compute center-to-camera distance once
+      const cdx = wx + step / 2 - selfX, cdy = wy + step / 2 - selfY;
+      const distSq = cdx * cdx + cdy * cdy;
       let x0 = wx, y0 = wy;
-      const x1 = Math.min(wx + step, 255), y1 = Math.min(wy + step, 255);
+      let x1 = Math.min(wx + step, 255), y1 = Math.min(wy + step, 255);
 
-      // Triangle dither: small coordinate offset for subtle animation
-      if (ditherPhase !== undefined) {
-        const dist0 = Math.sqrt((wx - selfX) ** 2 + (wy - selfY) ** 2);
-        const scale = 0.075 * Math.max(0, 1 - dist0 / 30);
-        if (scale > 0.001) {
-          const [ddx, ddy] = ditherNoise(wx * 0.6, wy * 0.6, ditherPhase);
-          x0 += ddx * scale;
-          y0 += ddy * scale;
+      // Triangle dither: tiny per-vertex wobble (~1% of cell) for subtle temporal info
+      if (hasDither && distSq < 1600) { // 40*40 = 1600, skip sqrt for range check
+        const dist0 = Math.sqrt(distSq);
+        const jitter = step * 0.012 * (1 - dist0 / 40);
+        if (jitter > 0.0001) {
+          const ph = ditherPhase!;
+          x0 += ditherNoise(wx, wy, ph) * jitter;
+          y0 += ditherNoise(wy, wx, ph) * jitter;
+          x1 += ditherNoise(wx + step, wy, ph) * jitter;
+          y1 += ditherNoise(wy + step, wx + step, ph) * jitter;
         }
       }
 
-      const h00 = terrain(Math.min(255, Math.max(0, Math.floor(x0))), Math.min(255, Math.max(0, Math.floor(y0))));
-      const h10 = terrain(x1, Math.min(255, Math.max(0, Math.floor(y0))));
-      const h01 = terrain(Math.min(255, Math.max(0, Math.floor(x0))), y1);
-      const h11 = terrain(x1, y1);
+      const ix0 = Math.min(255, Math.max(0, Math.floor(x0)));
+      const iy0 = Math.min(255, Math.max(0, Math.floor(y0)));
+      const h00 = step === 1 ? smoothedTerrain(terrain, ix0, iy0) : terrain(ix0, iy0);
+      const h10 = step === 1 ? smoothedTerrain(terrain, x1, iy0) : terrain(x1, iy0);
+      const h01 = step === 1 ? smoothedTerrain(terrain, ix0, y1) : terrain(ix0, y1);
+      const h11 = step === 1 ? smoothedTerrain(terrain, x1, y1) : terrain(x1, y1);
 
       // Average height for coloring
-      const hAvg = (h00 + h10 + h01 + h11) / 4;
+      const hAvg = (h00 + h10 + h01 + h11) * 0.25;
 
       // Skip water cells in hybrid mode
       if (skipWater && hAvg < waterHeight) continue;
 
-      const dist = Math.sqrt((wx + step / 2 - selfX) ** 2 + (wy + step / 2 - selfY) ** 2);
+      const dist = Math.sqrt(distSq);
       const centerWx = wx + step / 2, centerWy = wy + step / 2;
       let [r, g, b] = terrainTexture
         ? terrainTexturedRGB(hAvg, waterHeight, centerWx, centerWy)
@@ -1165,19 +1608,13 @@ function renderTerrainPatch(
       }
       [r, g, b] = fogRGB(r, g, b, dist, maxDepth, fogColor);
 
-      // Two triangles per cell
-      const positions = new Float32Array([
-        x0, y0, h00,
-        x1, y0, h10,
-        x0, y1, h01,
-        x1, y1, h11,
-      ]);
-      const indices = new Uint16Array([
-        0, 1, 2, // lower-left triangle
-        1, 3, 2, // upper-right triangle
-      ]);
+      // Write vertex positions into reusable buffer
+      _patchPositions[0] = x0; _patchPositions[1] = y0; _patchPositions[2] = h00;
+      _patchPositions[3] = x1; _patchPositions[4] = y0; _patchPositions[5] = h10;
+      _patchPositions[6] = x0; _patchPositions[7] = y1; _patchPositions[8] = h01;
+      _patchPositions[9] = x1; _patchPositions[10] = y1; _patchPositions[11] = h11;
 
-      rasterize(target, positions, indices, mvp, r, g, b);
+      rasterize(target, _patchPositions, _patchIndices, vp, r, g, b);
     }
   }
 }
@@ -1194,10 +1631,12 @@ function renderVoxelWater(
   horizon: number,
   ditherPhase: number,
   terrainTexture?: boolean,
+  heightScale?: number,
 ): void {
   const HALF_FOV = fov / 2;
   const NEAR = 1;
   const CAMERA_HEIGHT = selfZ;
+  const H_SCALE = heightScale ?? ph; // fall back to old behavior if not provided
 
   for (let pcol = 0; pcol < pw; pcol++) {
     const screenFrac = pcol / (pw - 1);
@@ -1223,7 +1662,7 @@ function renderVoxelWater(
         // Only draw water pixels
         if (h < waterHeight) {
           const correctedDepth = depth * cosCorrection;
-          const heightOnScreen = ((CAMERA_HEIGHT - waterHeight) / correctedDepth) * ph;
+          const heightOnScreen = ((CAMERA_HEIGHT - waterHeight) / correctedDepth) * H_SCALE;
           const screenPy = Math.round(horizon + heightOnScreen);
 
           if (screenPy >= 0 && screenPy < ph) {
@@ -1269,8 +1708,30 @@ export function projectFirstPerson(
   cols: number,
   rows: number,
 ): GridFrame {
-  const { selfX, selfY, selfZ, yaw, waterHeight, ditherPhase, skyColors, renderMode, terrainTexture } = params;
-  const useTriangles = renderMode !== 'voxel';
+  const { yaw, waterHeight, ditherPhase, skyColors, sunDir, renderMode, terrainTexture, flying, terrainHeight, cameraMode, cameraOrbitYaw, cameraOrbitPitch, selfAvatarPos, cloudParams, cloudTime } = params;
+  const isThirdPerson = cameraMode === 'third-person';
+
+  // In third-person mode, offset camera behind and above the avatar
+  // selfX/Y/Z from params is already at eye height (feet + 1.8m)
+  // For helicopter view: pull camera 8m back and 6m up, tilt down
+  // Camera orbit: yaw offset rotates camera position around the avatar
+  let selfX: number, selfY: number, selfZ: number;
+  const TP_BACK = 8;   // meters behind avatar
+  const TP_UP = 5;     // meters above avatar eye height
+  if (isThirdPerson) {
+    const effectiveYaw = yaw + (cameraOrbitYaw ?? 0);
+    const baseFwdX = Math.cos(effectiveYaw);
+    const baseFwdY = Math.sin(effectiveYaw);
+    selfX = params.selfX - baseFwdX * TP_BACK;
+    selfY = params.selfY - baseFwdY * TP_BACK;
+    selfZ = params.selfZ + TP_UP;
+  } else {
+    selfX = params.selfX;
+    selfY = params.selfY;
+    selfZ = params.selfZ;
+  }
+
+  const useTriangles = renderMode !== 'voxel' || isThirdPerson; // force triangles for third-person (voxel raycaster doesn't handle large pitch)
   const dither = ditherPhase !== undefined && ditherPhase > 0;
 
   // Sky colors from region environment, or defaults
@@ -1285,28 +1746,61 @@ export function projectFirstPerson(
   const buf = getFPPixelBuffer(pw, ph);
   clearFPPixelBuffer(buf, skyZenith, skyHorizon);
 
-  const fwdX = Math.cos(yaw);
-  const fwdY = Math.sin(yaw);
-  const rightX = Math.sin(yaw);
-  const rightY = -Math.cos(yaw);
+  const camYaw = isThirdPerson ? yaw + (cameraOrbitYaw ?? 0) : yaw;
+  const fwdX = Math.cos(camYaw);
+  const fwdY = Math.sin(camYaw);
+  const rightX = Math.sin(camYaw);
+  const rightY = -Math.cos(camYaw);
 
-  const MAX_DEPTH = 96;
-  const FOV = Math.PI / 3;           // 60° horizontal FOV
+  // Dynamic draw distance: extend when flying high (can see further from altitude)
+  const altAboveTerrain = (terrainHeight != null) ? Math.max(0, selfZ - terrainHeight) : 0;
+  const altAboveWater = Math.max(0, selfZ - waterHeight);
+  const effectiveAlt = Math.max(altAboveTerrain, altAboveWater);
+  // Scale draw distance: 96m at ground, up to 192m at 100m+ altitude
+  const BASE_DEPTH = 96;
+  const MAX_DEPTH = flying && effectiveAlt > 5
+    ? Math.min(192, BASE_DEPTH + effectiveAlt * 1.5)
+    : BASE_DEPTH;
+
+  const FOV = isThirdPerson ? Math.PI / 2 : Math.PI / 3; // 90° third-person, 60° first-person
   const HALF_FOV = FOV / 2;
+  if (cloudParams) renderCloudLayers(buf, cloudParams, yaw, FOV, cloudTime ?? 0);
   const NEAR = 1;
   const CAMERA_HEIGHT = selfZ;       // eye height in world
-  const PITCH = 0;                   // look straight ahead (radians, + = up)
+
+  // Vertical projection constant: maps world-space height/distance ratio to pixel rows
+  // Matches the perspective matrix used by the triangle renderer
+  const aspect = pw / ph;
+  const CELL_RATIO = 0.75; // sextant pixel display w/h ratio (terminal cells ~1:2)
+  const vFov = 2 * Math.atan(Math.tan(HALF_FOV) / (aspect * CELL_RATIO));
+  const HEIGHT_SCALE = (ph / 2) / Math.tan(vFov / 2); // pixels per unit height at unit distance
+
+  // Dynamic pitch: tilt camera down when flying high above terrain
+  // At ground level: PITCH=0 (straight ahead)
+  // At 20m above terrain: PITCH ≈ -0.2 rad (slight tilt)
+  // At 100m+: PITCH ≈ -0.5 rad (strong downward tilt, ~28°)
+  // Smoothly interpolated so it feels natural
+  let PITCH = 0;
+  if (isThirdPerson) {
+    // Third-person helicopter cam: tilt down to look at avatar (~30° down)
+    PITCH = -Math.atan2(TP_UP, TP_BACK) + (cameraOrbitPitch ?? 0);
+    PITCH = Math.max(-Math.PI / 3, Math.min(Math.PI / 6, PITCH)); // clamp
+  } else if (flying && effectiveAlt > 3) {
+    // Sigmoid-like curve: ramps from 0 to -0.55 rad as altitude increases
+    const t = Math.min(1, (effectiveAlt - 3) / 80); // 0→1 over 3-83m
+    PITCH = -0.55 * t * t * (3 - 2 * t); // smoothstep
+  }
   const HORIZON = Math.floor(ph / 2) - Math.round(PITCH * ph / FOV);
 
   if (useTriangles) {
     // ─── Triangle-based terrain rendering ───────────────────────────
     const triDither = dither ? ditherPhase : undefined;
     const isHybrid = renderMode === 'hybrid';
-    renderTerrainTriangles(buf, pw, ph, terrain, selfX, selfY, selfZ, yaw, waterHeight, fogColor, MAX_DEPTH, FOV, triDither, isHybrid, terrainTexture);
+    renderTerrainTriangles(buf, pw, ph, terrain, selfX, selfY, selfZ, yaw, waterHeight, fogColor, MAX_DEPTH, FOV, triDither, isHybrid, terrainTexture, PITCH);
 
     if (isHybrid) {
       // Voxel water overlay for hybrid mode
-      renderVoxelWater(buf, pw, ph, terrain, selfX, selfY, selfZ, yaw, waterHeight, fogColor, MAX_DEPTH, FOV, HORIZON, dither ? ditherPhase! : 0, terrainTexture);
+      renderVoxelWater(buf, pw, ph, terrain, selfX, selfY, selfZ, yaw, waterHeight, fogColor, MAX_DEPTH, FOV, HORIZON, dither ? ditherPhase! : 0, terrainTexture, HEIGHT_SCALE);
     }
   } else {
     // ─── Comanche-style voxel space raycasting ───────────────────────
@@ -1334,11 +1828,10 @@ export function projectFirstPerson(
 
         let sampleX = wx, sampleY = wy;
         if (dither) {
-          const scale = Math.max(0, 1 - depth / 30);
-          if (scale > 0.01) {
-            const [ddx, ddy] = ditherNoise(wx * 0.6, wy * 0.6, ditherPhase!);
-            sampleX += ddx * scale;
-            sampleY += ddy * scale;
+          const jitter = 0.15 * Math.max(0, 1 - depth / 30);
+          if (jitter > 0.001) {
+            sampleX += ditherNoise(wx, wy, ditherPhase!) * jitter;
+            sampleY += ditherNoise(wy, wx, ditherPhase!) * jitter;
           }
         }
 
@@ -1352,7 +1845,7 @@ export function projectFirstPerson(
                   + h01 * (1 - fx) * fy + h11 * fx * fy;
 
           const correctedDepth = depth * cosCorrection;
-          const heightOnScreen = ((CAMERA_HEIGHT - h) / correctedDepth) * ph;
+          const heightOnScreen = ((CAMERA_HEIGHT - h) / correctedDepth) * HEIGHT_SCALE;
           const screenPy = Math.round(HORIZON + heightOnScreen);
 
           let drawTop = screenPy;
@@ -1371,27 +1864,48 @@ export function projectFirstPerson(
             if (h >= waterHeight) {
               const gx = h10 - h00;
               const gy = h01 - h00;
-              const shade = 0.85 + 0.15 * Math.max(-1, Math.min(1, (-gx + gy) * 0.3));
-              tr = Math.round(tr * shade);
-              tg = Math.round(tg * shade);
-              tb = Math.round(tb * shade);
+              let shade: number;
+              if (sunDir) {
+                // Normal = (-gx, -gy, 1). Terrain slopes are small so |N| ≈ 1.
+                // Skip sqrt: use unnormalized dot directly (error < 5% for slopes < 45°)
+                const dot = -gx * sunDir[0] - gy * sunDir[1] + sunDir[2];
+                shade = 0.55 + 0.45 * Math.max(0, Math.min(1, dot));
+              } else {
+                shade = 0.85 + 0.15 * Math.max(-1, Math.min(1, (-gx + gy) * 0.3));
+              }
+              tr = tr * shade + 0.5 | 0;
+              tg = tg * shade + 0.5 | 0;
+              tb = tb * shade + 0.5 | 0;
             }
 
-            [tr, tg, tb] = fogRGB(tr, tg, tb, depth, MAX_DEPTH, fogColor);
+            // Inline fog (avoid tuple allocation)
+            const fogT = Math.min(1, depth / MAX_DEPTH);
+            tr = tr + (fogColor[0] - tr) * fogT + 0.5 | 0;
+            tg = tg + (fogColor[1] - tg) * fogT + 0.5 | 0;
+            tb = tb + (fogColor[2] - tb) * fogT + 0.5 | 0;
 
+            // Write pixel column directly (bounds already clamped above)
+            const bufPixels = buf.pixels;
+            const bufDepth = buf.depth;
             const spanLen = drawTo - drawFrom;
-            for (let py = drawFrom; py < drawTo; py++) {
-              if (spanLen > 1) {
-                const vt = (py - drawFrom) / (spanLen - 1);
-                const vShade = 1.08 - 0.16 * vt;
-                setFPPixel(buf, pcol, py,
-                  Math.min(255, Math.round(tr * vShade)),
-                  Math.min(255, Math.round(tg * vShade)),
-                  Math.min(255, Math.round(tb * vShade)),
-                  undefined, correctedDepth);
-              } else {
-                setFPPixel(buf, pcol, py, tr, tg, tb, undefined, correctedDepth);
+            if (spanLen > 1) {
+              const invSpan = 1 / (spanLen - 1);
+              for (let py = drawFrom; py < drawTo; py++) {
+                const vShade = 1.08 - 0.16 * ((py - drawFrom) * invSpan);
+                const idx = py * pw + pcol;
+                const ci = idx * 4;
+                bufPixels[ci]     = Math.min(255, tr * vShade + 0.5 | 0);
+                bufPixels[ci + 1] = Math.min(255, tg * vShade + 0.5 | 0);
+                bufPixels[ci + 2] = Math.min(255, tb * vShade + 0.5 | 0);
+                bufPixels[ci + 3] = 255;
+                bufDepth[idx] = correctedDepth;
               }
+            } else {
+              const idx = drawFrom * pw + pcol;
+              const ci = idx * 4;
+              bufPixels[ci] = tr; bufPixels[ci + 1] = tg;
+              bufPixels[ci + 2] = tb; bufPixels[ci + 3] = 255;
+              bufDepth[idx] = correctedDepth;
             }
 
             topDrawn[pcol] = drawFrom;
@@ -1421,70 +1935,157 @@ export function projectFirstPerson(
   }
 
   // ─── Project world position to screen pixel coords ────────────
-  // Shared projection for objects and avatars
+  // _wsVP is computed lazily after _objView/_objProj are populated
+  let _wsVPReady = false;
+
   function worldToScreen(wx: number, wy: number, wz: number): { px: number; py: number; dist: number } | null {
+    if (!_wsVPReady) {
+      mat4Multiply(_wsVP, _objProj, _objView);
+      _wsVPReady = true;
+    }
     const dx = wx - selfX;
     const dy = wy - selfY;
     const forwardDist = dx * fwdX + dy * fwdY;
     if (forwardDist < NEAR || forwardDist > MAX_DEPTH) return null;
 
-    const lateralDist = dx * rightX + dy * rightY;
-    // Perspective projection: positive lateral = right in world → right on screen (high px)
-    const angleOffset = Math.atan2(lateralDist, forwardDist);
-    const screenFrac = 0.5 + angleOffset / FOV;
-    const px = Math.round(screenFrac * pw);
-    if (px < 0 || px >= pw) return null;
+    // Transform through view-projection matrix
+    const cx = _wsVP[0] * wx + _wsVP[4] * wy + _wsVP[8] * wz + _wsVP[12];
+    const cy = _wsVP[1] * wx + _wsVP[5] * wy + _wsVP[9] * wz + _wsVP[13];
+    const cw = _wsVP[3] * wx + _wsVP[7] * wy + _wsVP[11] * wz + _wsVP[15];
+    if (cw <= 0) return null;
 
-    const heightOnScreen = ((CAMERA_HEIGHT - wz) / forwardDist) * ph;
-    const py = Math.round(HORIZON + heightOnScreen);
+    const ndcX = cx / cw;
+    const ndcY = cy / cw;
+    // NDC: x in [-1,1] left to right, y in [-1,1] bottom to top
+    const px = Math.round((ndcX + 1) * 0.5 * pw);
+    const py = Math.round((1 - ndcY) * 0.5 * ph); // flip Y: screen top = 0
+    if (px < 0 || px >= pw) return null;
 
     return { px, py, dist: forwardDist };
   }
 
   // Objects: near objects rendered as 3D shapes, far objects as tinted rectangles
-  // Sort by distance (far first) for correct occlusion via depth buffer
-  const sortedObjects = objects
-    .map(obj => {
-      const dx = obj.x - selfX, dy = obj.y - selfY;
-      const dist = dx * fwdX + dy * fwdY;
-      return { obj, dist };
-    })
-    .filter(o => o.dist > NEAR && o.dist < MAX_DEPTH)
-    .sort((a, b) => b.dist - a.dist);
+  // Single-pass: compute distance, filter, and partition into near/far
+  const nearObjRange = flying && effectiveAlt > 10 ? Math.min(80, 40 + effectiveAlt * 0.5) : 40;
+  const sortedObjects: { obj: ObjectData; dist: number }[] = [];
+  const nearObjects: { obj: ObjectData; dist: number }[] = [];
+  const nearSet = new Set<string>();
 
-  // Near-object 3D rendering (closest 200 prims within 40m)
-  const nearObjects = sortedObjects.filter(o => o.dist < 40 && !o.obj.isTree).slice(-200);
-  const nearSet = new Set(nearObjects.map(o => o.obj.uuid));
+  for (let i = 0; i < objects.length; i++) {
+    const obj = objects[i];
+    const dx = obj.x - selfX, dy = obj.y - selfY;
+    const dist = dx * fwdX + dy * fwdY;
+    if (dist <= NEAR || dist >= MAX_DEPTH) continue;
+    const entry = { obj, dist };
+    sortedObjects.push(entry);
+    if (dist < nearObjRange && !obj.isTree) {
+      nearObjects.push(entry);
+    }
+  }
+  sortedObjects.sort((a, b) => b.dist - a.dist);
 
-  // Build shared view/projection for object rasterization (same frustum as terrain triangles)
+  // Cap near objects at 200, preferring closest
+  if (nearObjects.length > 200) {
+    nearObjects.sort((a, b) => a.dist - b.dist);
+    nearObjects.length = 200;
+  }
+  for (const o of nearObjects) nearSet.add(o.obj.uuid);
+
+  // Build shared view/projection for object rasterization (same frustum as terrain, with pitch)
+  const objFwdX = Math.cos(yaw) * Math.cos(PITCH), objFwdY = Math.sin(yaw) * Math.cos(PITCH);
+  const objFwdZ = Math.sin(PITCH);
   const objEye = [selfX, selfY, selfZ];
-  const objLookAt = [selfX + fwdX * 10, selfY + fwdY * 10, selfZ];
-  const objView = new Float32Array(16);
-  mat4LookAt(objView, objEye, objLookAt, [0, 0, 1]);
-  const aspect = pw / ph;
-  const vFovObj = 2 * Math.atan(Math.tan(FOV / 2) / aspect);
-  const objProj = new Float32Array(16);
-  mat4Perspective(objProj, vFovObj, aspect, 0.5, MAX_DEPTH);
-  const objModel = new Float32Array(16);
-  const objMV = new Float32Array(16);
-  const objMVP = new Float32Array(16);
+  const objLookAt = [selfX + objFwdX * 10, selfY + objFwdY * 10, selfZ + objFwdZ * 10];
+  mat4LookAt(_objView, objEye, objLookAt, [0, 0, 1]);
+  const vFovObj = 2 * Math.atan(Math.tan(FOV / 2) / (aspect * CELL_RATIO));
+  mat4Perspective(_objProj, vFovObj, aspect, 0.5, MAX_DEPTH);
 
   // Rasterize all near objects into a single full-size target
   const objTarget = getObjFullTarget(pw, ph);
   clearObjFullTarget(objTarget);
 
+  // Collect mesh UUIDs from visible objects for async download
+  const sceneMeshLookup = params.sceneMeshLookup;
+  const sceneMeshTrigger = params.sceneMeshTrigger;
+  const meshUUIDsToFetch: string[] = [];
+
   for (const { obj, dist: forwardDist } of nearObjects) {
     // Skip nearly transparent objects
     if (obj.alpha !== undefined && obj.alpha < 0.1) continue;
-    const geo = getUnitGeometry(obj.pathCurve, obj.profileCurve);
+
+    // Projected-size culling: estimate pixel height on screen
+    const projectedH = Math.max(obj.scaleX, obj.scaleY, obj.scaleZ) / forwardDist * ph;
+    if (projectedH < 2) {
+      // Too small for rasterization — render as a few pixels directly (like far objects)
+      const proj = worldToScreen(obj.x, obj.y, obj.z);
+      if (proj) {
+        const [or, og, ob] = fogRGB(obj.colorR, obj.colorG, obj.colorB, forwardDist, MAX_DEPTH, fogColor);
+        for (let dy = -1; dy <= 0; dy++) {
+          setFPPixel(buf, proj.px, proj.py + dy, or, og, ob, obj.uuid, forwardDist);
+        }
+      }
+      continue;
+    }
+
+    // For objects projecting < 4 pixels, use simpler box geometry
+    const useSimpleGeo = projectedH < 4;
+
+    // Try mesh prim rendering first
+    if (obj.meshUUID && sceneMeshLookup && !useSimpleGeo) {
+      const meshes = sceneMeshLookup(obj.meshUUID);
+      if (meshes && meshes.length > 0) {
+        mat4ModelPosScaleRot(
+          _objModel,
+          obj.x, obj.y, obj.z,
+          obj.scaleX, obj.scaleY, obj.scaleZ,
+          obj.rotX, obj.rotY, obj.rotZ, obj.rotW,
+        );
+        mat4Multiply(_objMV, _objView, _objModel);
+        mat4Multiply(_objMVP, _objProj, _objMV);
+        let [fr, fg, fb] = fogRGB(obj.colorR, obj.colorG, obj.colorB, forwardDist, MAX_DEPTH, fogColor);
+        if (obj.alpha !== undefined && obj.alpha < 1) {
+          fr = Math.round(fr * obj.alpha);
+          fg = Math.round(fg * obj.alpha);
+          fb = Math.round(fb * obj.alpha);
+        }
+        for (const mesh of meshes) {
+          rasterize(objTarget, mesh.positions, mesh.indices, _objMVP, fr, fg, fb, obj.uuid, obj.fullbright, undefined, undefined, sunDir);
+        }
+        continue; // skip prim fallback
+      } else if (!meshes) {
+        // Queue for download
+        meshUUIDsToFetch.push(obj.meshUUID);
+      }
+    }
+
+    // Use parameterized geometry if shape modifiers are present
+    // For tiny projected objects (<4px), use a simple box instead of complex geometry
+    let geo: UnitGeometry;
+    if (useSimpleGeo) {
+      geo = getBoxGeometry();
+    } else {
+      const shapeParams: ShapeParams = {
+        hollow: obj.profileHollow,
+        begin: obj.pathBegin,
+        end: obj.pathEnd,
+        twist: obj.pathTwist,
+        twistBegin: obj.pathTwistBegin,
+        taperX: obj.pathTaperX,
+        taperY: obj.pathTaperY,
+      };
+      geo = hasShapeParams(shapeParams)
+        ? getParameterizedGeometry(obj.pathCurve, obj.profileCurve, shapeParams)
+        : getUnitGeometry(obj.pathCurve, obj.profileCurve);
+    }
+
     mat4ModelPosScaleRot(
-      objModel,
-      obj.x, obj.y, obj.z + obj.scaleZ / 2,
+      _objModel,
+      obj.x, obj.y, obj.z,
       obj.scaleX, obj.scaleY, obj.scaleZ,
       obj.rotX, obj.rotY, obj.rotZ, obj.rotW,
     );
-    mat4Multiply(objMV, objView, objModel);
-    mat4Multiply(objMVP, objProj, objMV);
+    mat4Multiply(_objMV, _objView, _objModel);
+    mat4Multiply(_objMVP, _objProj, _objMV);
     let [fr, fg, fb] = fogRGB(obj.colorR, obj.colorG, obj.colorB, forwardDist, MAX_DEPTH, fogColor);
     // Apply partial alpha
     if (obj.alpha !== undefined && obj.alpha < 1) {
@@ -1492,22 +2093,46 @@ export function projectFirstPerson(
       fg = Math.round(fg * obj.alpha);
       fb = Math.round(fb * obj.alpha);
     }
-    rasterize(objTarget, geo.positions, geo.indices, objMVP, fr, fg, fb, obj.uuid, obj.fullbright);
+
+    // Per-face colors: fog each face color individually
+    let foggedFaceColors: [number, number, number, number][] | undefined;
+    const faceIdxFn = obj.faceColors ? getFaceIndexFn(obj.pathCurve, obj.profileCurve) : undefined;
+    if (obj.faceColors && faceIdxFn) {
+      foggedFaceColors = obj.faceColors.map(fc => {
+        const [fcr, fcg, fcb] = fogRGB(fc[0], fc[1], fc[2], forwardDist, MAX_DEPTH, fogColor);
+        return [fcr, fcg, fcb, fc[3]] as [number, number, number, number];
+      });
+    }
+
+    rasterize(objTarget, geo.positions, geo.indices, _objMVP, fr, fg, fb, obj.uuid, obj.fullbright, foggedFaceColors, faceIdxFn, sunDir);
+  }
+
+  // Trigger mesh downloads for visible objects
+  if (sceneMeshTrigger && meshUUIDsToFetch.length > 0) {
+    sceneMeshTrigger(meshUUIDsToFetch);
   }
 
   // Copy rasterized object pixels to FP buffer with depth conversion
   const isVoxelMode = !useTriangles;
-  for (let py = 0; py < ph; py++) {
-    for (let px = 0; px < pw; px++) {
-      const si = (py * pw + px) * 4;
-      if (objTarget.color[si + 3] === 0) continue;
-      const idx = py * pw + px;
-      const ndcZ = objTarget.depth[idx];
-      // In voxel mode, FP buffer depth is world distance — linearize NDC depth
-      const pixDepth = isVoxelMode ? ndcDepthToWorldDist(ndcZ, 0.5, MAX_DEPTH) : ndcZ;
-      const oid = objTarget.oids ? objTarget.oids[idx] : undefined;
-      setFPPixel(buf, px, py, objTarget.color[si], objTarget.color[si + 1], objTarget.color[si + 2], oid, pixDepth);
-    }
+  const objColor = objTarget.color;
+  const objDepth = objTarget.depth;
+  const objOids = objTarget.oids;
+  const bufPixels = buf.pixels;
+  const bufDepth = buf.depth;
+  const bufOids = buf.oids;
+  const totalPx = pw * ph;
+  for (let idx = 0; idx < totalPx; idx++) {
+    const si = idx * 4;
+    if (objColor[si + 3] === 0) continue;
+    const ndcZ = objDepth[idx];
+    const pixDepth = isVoxelMode ? ndcDepthToWorldDist(ndcZ, 0.5, MAX_DEPTH) : ndcZ;
+    if (pixDepth >= bufDepth[idx]) continue;
+    bufPixels[si]     = objColor[si];
+    bufPixels[si + 1] = objColor[si + 1];
+    bufPixels[si + 2] = objColor[si + 2];
+    bufPixels[si + 3] = 255;
+    bufDepth[idx] = pixDepth;
+    if (objOids) bufOids[idx] = objOids[idx];
   }
 
   // Far/tree objects: tinted rectangles
@@ -1515,7 +2140,7 @@ export function projectFirstPerson(
     if (nearSet.has(obj.uuid)) continue;
     if (obj.alpha !== undefined && obj.alpha < 0.1) continue;
     {
-      const proj = worldToScreen(obj.x, obj.y, obj.z + obj.scaleZ / 2);
+      const proj = worldToScreen(obj.x, obj.y, obj.z);
       if (!proj) continue;
       const { px: screenPx, py: screenPy } = proj;
       if (screenPy < 0 || screenPy >= ph) continue;
@@ -1531,13 +2156,17 @@ export function projectFirstPerson(
       const startPy = Math.max(0, screenPy - entityPxH + 1);
       const startPx = screenPx - Math.floor(entityPxW / 2);
 
+      // In triangle mode, convert world distance to NDC depth for depth buffer compatibility
+      const objPixDepth = useTriangles
+        ? worldDistToNdcDepth(forwardDist, 0.5, MAX_DEPTH)
+        : forwardDist;
       // Tree silhouettes for near-ish trees
       if (obj.isTree && forwardDist < 50) {
-        renderTreePixels(buf, pw, ph, obj.treeSpecies, obj.pcode, screenPx, screenPy, entityPxH, or, og, ob, obj.uuid, forwardDist);
+        renderTreePixels(buf, pw, ph, obj.treeSpecies, obj.pcode, screenPx, screenPy, entityPxH, or, og, ob, obj.uuid, objPixDepth);
       } else {
         for (let py = startPy; py <= screenPy && py < ph; py++) {
           for (let px = startPx; px < startPx + entityPxW && px < pw; px++) {
-            setFPPixel(buf, px, py, or, og, ob, obj.uuid, forwardDist);
+            setFPPixel(buf, px, py, or, og, ob, obj.uuid, objPixDepth);
           }
         }
       }
@@ -1548,10 +2177,17 @@ export function projectFirstPerson(
   // Track screen positions for name labels
   const avatarScreenPos: { uuid: string; cellCol: number; shoulderRow: number; dist: number }[] = [];
   const meshLookup = params.meshLookup;
+  const appearanceLookup = params.appearanceLookup;
+  const bakedColorsLookup = params.bakedColorsLookup;
   for (const av of avatars) {
-    if (av.isSelf) continue;
+    if (av.isSelf && !isThirdPerson) continue;
 
-    const headProj = worldToScreen(av.x, av.y, av.z + 2);
+    // Look up appearance data for height adjustment
+    const appearance = appearanceLookup ? appearanceLookup(av.uuid) : null;
+    const heightFactor = appearance ? lerp(1.1, 2.3, appearance.height / 255) / 1.8 : 1;
+    const avatarHeight = 2 * heightFactor;
+
+    const headProj = worldToScreen(av.x, av.y, av.z + avatarHeight);
     const feetProj = worldToScreen(av.x, av.y, av.z);
     if (!headProj && !feetProj) continue;
 
@@ -1588,10 +2224,17 @@ export function projectFirstPerson(
     }
 
     if (!rendered) {
-      const avBaseColor = avatarColorFromUUID(av.uuid);
+      // Get baked texture colors or fall back to UUID-based color
+      const bakedColors = bakedColorsLookup ? bakedColorsLookup(av.uuid) : null;
+      const avBaseColor = bakedColors ? bakedColors.upperBody : avatarColorFromUUID(av.uuid);
       const [ar, ag, ab] = fogRGB(avBaseColor[0], avBaseColor[1], avBaseColor[2], forwardDist, MAX_DEPTH, fogColor);
       const velMag = Math.sqrt(av.velX * av.velX + av.velY * av.velY + av.velZ * av.velZ);
-      renderPixelAvatar(buf, pw, ph, screenPx, headPy, figH, ar, ag, ab, av.uuid, forwardDist, velMag);
+      // In triangle mode, depth buffer uses NDC values; convert world distance to NDC depth
+      // Use slightly closer depth so avatar wins against terrain it stands on
+      const avDepth = useTriangles
+        ? worldDistToNdcDepth(forwardDist * 0.98, 0.5, MAX_DEPTH)
+        : forwardDist * 0.98;
+      renderPixelAvatar(buf, pw, ph, screenPx, headPy, figH, ar, ag, ab, av.uuid, avDepth, velMag, appearance, bakedColors, fogColor, MAX_DEPTH);
     }
   }
 
@@ -1773,6 +2416,10 @@ function renderPixelAvatar(
   r: number, g: number, b: number, uuid: string,
   avDepth: number,
   velMag = 0,
+  appearance?: AvatarAppearanceData | null,
+  bakedColors?: BakedTextureColors | null,
+  fogColor?: [number, number, number],
+  maxDepth?: number,
 ): void {
   if (figH <= 3) {
     // Tiny: just a dot
@@ -1786,26 +2433,62 @@ function renderPixelAvatar(
   const isWalking = velMag > 0.5;
   const walkFrame = isWalking ? (Date.now() % 600 < 300 ? 1 : -1) : 0;
 
+  // Shape-morphed proportions from appearance data
+  const hs = appearance ? lerp(0.8, 1.3, appearance.headSize / 255) : 1;
+  const sw = appearance ? lerp(0.7, 1.4, appearance.shoulderWidth / 255) : 1;
+  const hw = appearance ? lerp(0.7, 1.3, appearance.hipWidth / 255) : 1;
+  const tl = appearance ? lerp(0.8, 1.2, appearance.torsoLength / 255) : 1;
+  const bt = appearance ? lerp(0.85, 1.15, (appearance.bodyThickness ?? 128) / 255) : 1;
+
   // Proportional humanoid shape with more detail
-  const headH = Math.max(2, Math.round(figH * 0.14));
+  const headH = Math.max(2, Math.round(figH * 0.14 * hs));
   const neckH = Math.max(1, Math.round(figH * 0.03));
-  const torsoH = Math.max(2, Math.round(figH * 0.32));
+  const torsoH = Math.max(2, Math.round(figH * 0.32 * tl));
   const hipH = Math.max(1, Math.round(figH * 0.06));
   const legH = Math.max(1, figH - headH - neckH - torsoH - hipH);
-  const headW = Math.max(1, Math.round(figH * 0.10));
+  const headW = Math.max(1, Math.round(figH * 0.10 * hs));
   const neckW = Math.max(1, Math.round(headW * 0.5));
-  const shoulderW = Math.max(2, Math.round(figH * 0.20));
+  const shoulderW = Math.max(2, Math.round(figH * 0.20 * sw * bt));
   const waistW = Math.max(1, Math.round(shoulderW * 0.7));
-  const hipW = Math.max(1, Math.round(shoulderW * 0.85));
-  const armW = Math.max(1, Math.round(figH * 0.05));
+  const hipW = Math.max(1, Math.round(shoulderW * 0.85 * hw));
+  const armW = Math.max(1, Math.round(figH * 0.05 * bt));
   const legW = Math.max(1, Math.round(figH * 0.06));
 
-  // Skin tone (lighter shade of base)
-  const skinR = Math.min(255, r + 60), skinG = Math.min(255, g + 45), skinB = Math.min(255, b + 35);
-  // Hair (darker)
-  const hairR = Math.max(0, r - 20), hairG = Math.max(0, g - 20), hairB = Math.max(0, b - 15);
+  // Zone-mapped colors from baked textures, or fallback to base color
+  let skinR: number, skinG: number, skinB: number;
+  let hairR: number, hairG: number, hairB: number;
+  let upperR: number, upperG: number, upperB: number;
+  let lowerR: number, lowerG: number, lowerB: number;
+
+  if (bakedColors) {
+    // Use baked texture colors with fog applied
+    const md = maxDepth ?? 96;
+    const fc = fogColor ?? [0x66, 0x77, 0x88];
+    [skinR, skinG, skinB] = fogRGB(bakedColors.head[0], bakedColors.head[1], bakedColors.head[2], avDepth, md, fc);
+    [hairR, hairG, hairB] = fogRGB(bakedColors.hair[0], bakedColors.hair[1], bakedColors.hair[2], avDepth, md, fc);
+    [upperR, upperG, upperB] = fogRGB(bakedColors.upperBody[0], bakedColors.upperBody[1], bakedColors.upperBody[2], avDepth, md, fc);
+    [lowerR, lowerG, lowerB] = fogRGB(bakedColors.lowerBody[0], bakedColors.lowerBody[1], bakedColors.lowerBody[2], avDepth, md, fc);
+  } else if (appearance) {
+    // Use skin color from visual params
+    const sc = appearance.skinColor;
+    const md = maxDepth ?? 96;
+    const fc = fogColor ?? [0x66, 0x77, 0x88];
+    [skinR, skinG, skinB] = fogRGB(sc[0], sc[1], sc[2], avDepth, md, fc);
+    hairR = Math.max(0, skinR - 40);
+    hairG = Math.max(0, skinG - 40);
+    hairB = Math.max(0, skinB - 30);
+    upperR = r; upperG = g; upperB = b;
+    lowerR = Math.max(0, r - 10); lowerG = Math.max(0, g - 10); lowerB = Math.max(0, b - 8);
+  } else {
+    // Fallback: derive from base color
+    skinR = Math.min(255, r + 60); skinG = Math.min(255, g + 45); skinB = Math.min(255, b + 35);
+    hairR = Math.max(0, r - 20); hairG = Math.max(0, g - 20); hairB = Math.max(0, b - 15);
+    upperR = r; upperG = g; upperB = b;
+    lowerR = Math.max(0, r - 10); lowerG = Math.max(0, g - 10); lowerB = Math.max(0, b - 8);
+  }
+
   // Shadow side (slightly darker body)
-  const shadR = Math.max(0, r - 15), shadG = Math.max(0, g - 15), shadB = Math.max(0, b - 12);
+  const shadR = Math.max(0, upperR - 15), shadG = Math.max(0, upperG - 15), shadB = Math.max(0, upperB - 12);
 
   let py = headPy;
 
@@ -1835,7 +2518,7 @@ function renderPixelAvatar(
     }
   }
 
-  // Torso (tapers from shoulders to waist) + arms
+  // Torso (tapers from shoulders to waist) + arms — uses upperBody color
   const armStartDy = Math.round(torsoH * 0.05);
   const armEndDy = Math.round(torsoH * 0.55);
   for (let dy = 0; dy < torsoH && py < headPy + figH; dy++, py++) {
@@ -1847,7 +2530,7 @@ function renderPixelAvatar(
       if (isShadow) {
         setFPPixel(buf, centerPx + dx, py, shadR, shadG, shadB, uuid, avDepth);
       } else {
-        setFPPixel(buf, centerPx + dx, py, r, g, b, uuid, avDepth);
+        setFPPixel(buf, centerPx + dx, py, upperR, upperG, upperB, uuid, avDepth);
       }
     }
     // Arms (swing opposite to legs when walking)
@@ -1869,14 +2552,15 @@ function renderPixelAvatar(
     }
   }
 
-  // Hips (slightly wider, transition to legs)
+  // Hips (slightly wider, transition to legs) — uses lowerBody color
+  const lShadR = Math.max(0, lowerR - 15), lShadG = Math.max(0, lowerG - 15), lShadB = Math.max(0, lowerB - 12);
   for (let dy = 0; dy < hipH && py < headPy + figH; dy++, py++) {
     for (let dx = -hipW; dx <= hipW; dx++) {
-      setFPPixel(buf, centerPx + dx, py, shadR, shadG, shadB, uuid, avDepth);
+      setFPPixel(buf, centerPx + dx, py, lShadR, lShadG, lShadB, uuid, avDepth);
     }
   }
 
-  // Legs (two separate columns that splay slightly)
+  // Legs (two separate columns that splay slightly) — uses lowerBody color
   for (let dy = 0; dy < legH && py < headPy + figH; dy++, py++) {
     const baseSplay = Math.min(dy, Math.round(figH * 0.04)) + 1;
     for (let side = -1; side <= 1; side += 2) {
@@ -1885,16 +2569,54 @@ function renderPixelAvatar(
       const legSplay = baseSplay + (isWalking ? Math.abs(walkOffset) : 0);
       const legCenter = centerPx + side * legSplay + (isWalking ? walkOffset : 0);
       for (let dx = -legW; dx <= legW; dx++) {
-        const isSkin = dy > legH * 0.7;
+        const isSkin = dy > legH * 0.7; // calves visible below pants
         if (isSkin) {
           setFPPixel(buf, legCenter + dx, py, skinR, skinG, skinB, uuid, avDepth);
         } else {
-          setFPPixel(buf, legCenter + dx, py, shadR - 5, shadG - 5, shadB - 5, uuid, avDepth);
+          setFPPixel(buf, legCenter + dx, py, lShadR - 5, lShadG - 5, lShadB - 5, uuid, avDepth);
         }
       }
     }
   }
 }
+
+// Attachment point offset table — body-relative offsets for common SL attachment points
+const ATTACH_OFFSETS: Record<number, [number, number, number]> = {
+  0:  [0, 0, 0],        // Default
+  1:  [0, 0, 0.8],      // Chest
+  2:  [0, 0, 1.6],      // Skull
+  3:  [-0.25, 0, 0.75], // Left shoulder
+  4:  [0.25, 0, 0.75],  // Right shoulder
+  5:  [-0.35, 0, 0.3],  // Left hand
+  6:  [0.35, 0, 0.3],   // Right hand
+  7:  [-0.15, 0, -0.3], // Left foot
+  8:  [0.15, 0, -0.3],  // Right foot
+  9:  [0, 0.2, 0.7],    // Spine (back)
+  10: [0, 0, 1.0],      // Pelvis
+  11: [0, 0, 1.3],      // Mouth
+  12: [0, 0, 1.45],     // Chin
+  13: [0, 0, 1.55],     // Left ear
+  14: [0, 0, 1.55],     // Right ear
+  15: [-0.25, 0, 1.55], // Left eyeball
+  16: [0.25, 0, 1.55],  // Right eyeball
+  17: [0, 0, 1.6],      // Nose
+  18: [0, 0, 1.4],      // R upper arm
+  19: [0, 0, 0.5],      // R forearm
+  20: [0, 0, 1.4],      // L upper arm
+  21: [0, 0, 0.5],      // L forearm
+  22: [0, 0, 0.2],      // R hip
+  23: [-0.1, 0, -0.1],  // R upper leg
+  24: [0, 0, 0.2],      // L hip
+  25: [0.1, 0, -0.1],   // L upper leg
+  26: [0, 0, 0.75],     // Stomach
+  27: [-0.15, 0, 0.55], // Left pec
+  28: [0.15, 0, 0.55],  // Right pec
+  29: [0, 0, 1.65],     // Center 2 (head)
+  30: [0, 0, 1.65],     // Top right (head)
+  31: [0, 0, 1.65],     // Top left (head)
+  39: [0, 0, 1.6],      // Neck
+  40: [0, 0, 1.6],      // Avatar Center
+};
 
 // Rasterize 3D mesh into the FP pixel buffer at the avatar's screen position
 function renderMeshToPixels(
@@ -1923,19 +2645,22 @@ function renderMeshToPixels(
   const proj = new Float32Array(16);
   mat4Perspective(proj, Math.PI / 3, aspect, 0.5, 100);
 
-  const model = new Float32Array(16);
-  mat4ModelPosScale(model, avX, avY, avZ, 1.0);
-
   const mv = new Float32Array(16);
   const mvp = new Float32Array(16);
-  mat4Multiply(mv, view, model);
-  mat4Multiply(mvp, proj, mv);
 
   const meshColor = avatarColorFromUUID(uuid);
   const mr = Math.min(255, meshColor[0] + 80);
   const mg = Math.min(255, meshColor[1] + 60);
   const mb = Math.min(255, meshColor[2] + 40);
+
+  const model = new Float32Array(16);
   for (const mesh of bundle.meshes) {
+    // Apply attachment offset if available
+    const ap = mesh.attachmentPoint ?? 0;
+    const offset = ATTACH_OFFSETS[ap] ?? [0, 0, 0];
+    mat4ModelPosScale(model, avX + offset[0], avY + offset[1], avZ + offset[2], 1.0);
+    mat4Multiply(mv, view, model);
+    mat4Multiply(mvp, proj, mv);
     rasterize(target, mesh.positions, mesh.indices, mvp, mr, mg, mb);
   }
 
@@ -1973,7 +2698,7 @@ export function diffFrames(prev: GridFrame, next: GridFrame): CellDelta[] {
   for (let i = 0; i < len; i++) {
     const p = prev.cells[i];
     const n = next.cells[i];
-    if (p.char !== n.char || p.fg !== n.fg || p.bg !== n.bg) {
+    if (p.char !== n.char || p.fg !== n.fg || p.bg !== n.bg || p.oid !== n.oid) {
       const row = Math.floor(i / next.cols);
       const col = i % next.cols;
       deltas.push({ idx: i, col, row, char: n.char, fg: n.fg, bg: n.bg, oid: n.oid });

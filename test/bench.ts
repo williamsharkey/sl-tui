@@ -79,7 +79,7 @@ async function main() {
       waterHeight,
       metersPerCell: 2,
       yaw: bridge.getBodyYaw(),
-    });
+    }, bridge.flying);
   }
   const minimapMs = (performance.now() - t0) / ITERATIONS;
 
@@ -99,7 +99,7 @@ async function main() {
     rows: layout.minimapRows,
     selfX: pos.x, selfY: pos.y, selfZ: pos.z,
     waterHeight, metersPerCell: 2, yaw: bridge.getBodyYaw(),
-  });
+  }, bridge.flying);
   t0 = performance.now();
   for (let i = 0; i < ITERATIONS; i++) {
     renderMinimapBuf(layout, mmFrame);

@@ -115,19 +115,24 @@ export function mat4ModelPosScaleRot(
   out[15] = 1;
 }
 
-// Transform a vertex by MVP, returning NDC (x,y,z,w)
+// Reusable scratch buffer for transformVertex — avoids per-call allocation
+const _tv = new Float64Array(4);
+
+// Transform a vertex by MVP, writing NDC into scratch buffer _tv[0..3] = (x,y,z,w)
 function transformVertex(
   mvp: Float32Array,
   x: number, y: number, z: number,
-): [number, number, number, number] {
+): void {
   const w = mvp[3] * x + mvp[7] * y + mvp[11] * z + mvp[15];
-  const nx = (mvp[0] * x + mvp[4] * y + mvp[8]  * z + mvp[12]) / w;
-  const ny = (mvp[1] * x + mvp[5] * y + mvp[9]  * z + mvp[13]) / w;
-  const nz = (mvp[2] * x + mvp[6] * y + mvp[10] * z + mvp[14]) / w;
-  return [nx, ny, nz, w];
+  _tv[0] = (mvp[0] * x + mvp[4] * y + mvp[8]  * z + mvp[12]) / w;
+  _tv[1] = (mvp[1] * x + mvp[5] * y + mvp[9]  * z + mvp[13]) / w;
+  _tv[2] = (mvp[2] * x + mvp[6] * y + mvp[10] * z + mvp[14]) / w;
+  _tv[3] = w;
 }
 
 // Rasterize triangles with MVP matrix. Color is solid RGB, shaded by depth.
+// Optional faceColors array maps face index → [R,G,B] for per-face coloring.
+// faceIndexFn maps triangle index (t/3) to face index (for geometry-specific face mapping).
 export function rasterize(
   target: RasterTarget,
   positions: Float32Array,   // flat xyz
@@ -136,6 +141,9 @@ export function rasterize(
   baseR: number, baseG: number, baseB: number,
   oid?: string,
   fullbright?: boolean,
+  faceColors?: [number, number, number, number][],
+  faceIndexFn?: (triIdx: number) => number,
+  lightDir?: [number, number, number],
 ): void {
   const { width, height, color, depth } = target;
   const hw = width / 2;
@@ -149,9 +157,12 @@ export function rasterize(
     const p1x = positions[i1 * 3], p1y = positions[i1 * 3 + 1], p1z = positions[i1 * 3 + 2];
     const p2x = positions[i2 * 3], p2y = positions[i2 * 3 + 1], p2z = positions[i2 * 3 + 2];
 
-    const [x0, y0, z0, w0] = transformVertex(mvp, p0x, p0y, p0z);
-    const [x1, y1, z1, w1] = transformVertex(mvp, p1x, p1y, p1z);
-    const [x2, y2, z2, w2] = transformVertex(mvp, p2x, p2y, p2z);
+    transformVertex(mvp, p0x, p0y, p0z);
+    const x0 = _tv[0], y0 = _tv[1], z0 = _tv[2], w0 = _tv[3];
+    transformVertex(mvp, p1x, p1y, p1z);
+    const x1 = _tv[0], y1 = _tv[1], z1 = _tv[2], w1 = _tv[3];
+    transformVertex(mvp, p2x, p2y, p2z);
+    const x2 = _tv[0], y2 = _tv[1], z2 = _tv[2], w2 = _tv[3];
 
     // Clip: skip if any vertex is behind camera
     if (w0 <= 0 || w1 <= 0 || w2 <= 0) continue;
@@ -161,18 +172,24 @@ export function rasterize(
     if (y0 < -1.5 && y1 < -1.5 && y2 < -1.5) continue;
     if (y0 > 1.5 && y1 > 1.5 && y2 > 1.5) continue;
 
-    // Face normal for directional lighting
-    const e1x = p1x - p0x, e1y = p1y - p0y, e1z = p1z - p0z;
-    const e2x = p2x - p0x, e2y = p2y - p0y, e2z = p2z - p0z;
-    let nx = e1y * e2z - e1z * e2y;
-    let ny = e1z * e2x - e1x * e2z;
-    let nz = e1x * e2y - e1y * e2x;
-    const nLen = Math.sqrt(nx * nx + ny * ny + nz * nz);
-    if (nLen > 0) { nx /= nLen; ny /= nLen; nz /= nLen; }
-    // Directional light from upper-left-forward
-    const lightDot = Math.max(0, nx * -0.4 + ny * 0.3 + nz * 0.7);
-    const ambient = 0.35;
-    const faceShade = fullbright ? 1.0 : ambient + (1 - ambient) * lightDot;
+    // Face shading: skip normal computation for fullbright surfaces
+    let faceShade: number;
+    if (fullbright) {
+      faceShade = 1.0;
+    } else {
+      const e1x = p1x - p0x, e1y = p1y - p0y, e1z = p1z - p0z;
+      const e2x = p2x - p0x, e2y = p2y - p0y, e2z = p2z - p0z;
+      let nx = e1y * e2z - e1z * e2y;
+      let ny = e1z * e2x - e1x * e2z;
+      let nz = e1x * e2y - e1y * e2x;
+      const nLen = Math.sqrt(nx * nx + ny * ny + nz * nz);
+      if (nLen > 0) { nx /= nLen; ny /= nLen; nz /= nLen; }
+      const lx = lightDir ? lightDir[0] : -0.4;
+      const ly = lightDir ? lightDir[1] : 0.3;
+      const lz = lightDir ? lightDir[2] : 0.7;
+      const lightDot = Math.max(0, nx * lx + ny * ly + nz * lz);
+      faceShade = 0.35 + 0.65 * lightDot;
+    }
 
     // Screen coordinates
     const sx0 = (x0 + 1) * hw, sy0 = (1 - y0) * hh;
@@ -194,36 +211,67 @@ export function rasterize(
     if (Math.abs(area) < 0.5) continue;
     const invArea = 1 / area;
 
+    // Determine face color — per-face if available, else base color
+    let fR = baseR, fG = baseG, fB = baseB;
+    if (faceColors && faceIndexFn) {
+      const triIdx = Math.floor(t / 3);
+      const faceIdx = faceIndexFn(triIdx);
+      if (faceIdx >= 0 && faceIdx < faceColors.length) {
+        const fc = faceColors[faceIdx];
+        fR = fc[0]; fG = fc[1]; fB = fc[2];
+        // Skip if face is nearly transparent
+        if (fc[3] < 0.1) continue;
+      }
+    }
+
     // Pre-compute shaded color for this face
-    const sr = Math.round(baseR * faceShade);
-    const sg = Math.round(baseG * faceShade);
-    const sb = Math.round(baseB * faceShade);
+    const sr = Math.round(fR * faceShade);
+    const sg = Math.round(fG * faceShade);
+    const sb = Math.round(fB * faceShade);
 
-    // Scanline rasterization with barycentric interpolation (edge function)
+    // Incremental edge-function rasterization
+    // Edge function coefficients: E(x,y) = A*x + B*y + C
+    // w0 edge: vertices 1→2, w1 edge: vertices 2→0
+    const a0 = (sy1 - sy2) * invArea;
+    const b0 = (sx2 - sx1) * invArea;
+    const a1 = (sy2 - sy0) * invArea;
+    const b1 = (sx0 - sx2) * invArea;
+    // Depth gradients per pixel step
+    const dzdx = a0 * z0 + a1 * z1 + (-(a0 + a1)) * z2;
+    const dzdy = b0 * z0 + b1 * z1 + (-(b0 + b1)) * z2;
+
+    // Evaluate edge functions at first pixel center (minX+0.5, minY+0.5)
+    const startCx = minX + 0.5, startCy = minY + 0.5;
+    let w0Row = ((sx1 - startCx) * (sy2 - startCy) - (sy1 - startCy) * (sx2 - startCx)) * invArea;
+    let w1Row = ((sx2 - startCx) * (sy0 - startCy) - (sy2 - startCy) * (sx0 - startCx)) * invArea;
+    let w2Row = 1 - w0Row - w1Row;
+    let zRow = w0Row * z0 + w1Row * z1 + w2Row * z2;
+
+    const hasOid = oid && target.oids;
     for (let py = minY; py <= maxY; py++) {
+      let w_0 = w0Row, w_1 = w1Row, pz = zRow;
+      let ci = (py * width + minX) * 4;
+      let di = py * width + minX;
       for (let px = minX; px <= maxX; px++) {
-        const cx = px + 0.5, cy = py + 0.5;
-
-        // Edge functions — weights are positive inside for both windings
-        const w_0 = ((sx1 - cx) * (sy2 - cy) - (sy1 - cy) * (sx2 - cx)) * invArea;
-        const w_1 = ((sx2 - cx) * (sy0 - cy) - (sy2 - cy) * (sx0 - cx)) * invArea;
-        const w_2 = 1 - w_0 - w_1;
-
-        if (w_0 < 0 || w_1 < 0 || w_2 < 0) continue;
-
-        const pz = w_0 * z0 + w_1 * z1 + w_2 * z2;
-        const idx = py * width + px;
-
-        if (pz < depth[idx]) {
-          depth[idx] = pz;
-          const ci = idx * 4;
+        // w_2 = 1 - w_0 - w_1; inside test: w_0 >= 0 && w_1 >= 0 && w_0+w_1 <= 1
+        if (w_0 >= 0 && w_1 >= 0 && w_0 + w_1 <= 1 && pz < depth[di]) {
+          depth[di] = pz;
           color[ci]     = sr;
           color[ci + 1] = sg;
           color[ci + 2] = sb;
           color[ci + 3] = 255;
-          if (oid && target.oids) target.oids[idx] = oid;
+          if (hasOid) target.oids![di] = oid;
         }
+        w_0 += a0;
+        w_1 += a1;
+        pz += dzdx;
+        ci += 4;
+        di++;
       }
+      // Step to next row
+      w0Row += b0;
+      w1Row += b1;
+      zRow += dzdy;
     }
   }
 }

@@ -1,6 +1,22 @@
 #!/usr/bin/env node
 // main.ts — CLI entry point for TUI client
 
+import * as fs from 'fs';
+
+// Crash log — write to file so terminal corruption doesn't hide the error
+const crashLog = (label: string, err: any) => {
+  const msg = `[${new Date().toISOString()}] ${label}: ${err?.stack || err}\n`;
+  try { fs.appendFileSync('/tmp/sl-tui-crash.log', msg); } catch {}
+};
+process.on('uncaughtException', (err) => {
+  crashLog('UNCAUGHT', err);
+  process.exit(1);
+});
+process.on('unhandledRejection', (err) => {
+  crashLog('UNHANDLED_REJECTION', err);
+  process.exit(1);
+});
+
 import { SLBridge } from '../server/sl-bridge.js';
 import { TUIApp } from './app.js';
 import { computeLayout } from './screen.js';

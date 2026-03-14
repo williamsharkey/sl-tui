@@ -52,11 +52,12 @@ function buildSextantTable(): void {
 
 buildSextantTable();
 
+// Precomputed hex digit pairs for 0-255
+const HEX_PAIRS: string[] = new Array(256);
+for (let i = 0; i < 256; i++) HEX_PAIRS[i] = i.toString(16).padStart(2, '0');
+
 function rgbToHex(r: number, g: number, b: number): string {
-  return '#' +
-    (r | 0).toString(16).padStart(2, '0') +
-    (g | 0).toString(16).padStart(2, '0') +
-    (b | 0).toString(16).padStart(2, '0');
+  return '#' + HEX_PAIRS[r & 255] + HEX_PAIRS[g & 255] + HEX_PAIRS[b & 255];
 }
 
 function colorDistSq(r1: number, g1: number, b1: number, r2: number, g2: number, b2: number): number {
@@ -76,73 +77,82 @@ export function pixelsToCells(
   pixelWidth: number,
   pixelHeight: number,
   bgR: number, bgG: number, bgB: number,
+  stochasticPhase?: number,
+  stochasticStrength?: number,
 ): { cells: Cell[]; cols: number; rows: number } {
   const cols = Math.ceil(pixelWidth / 2);
   const rows = Math.ceil(pixelHeight / 3);
   const cells: Cell[] = new Array(cols * rows);
 
-  for (let cr = 0; cr < rows; cr++) {
-    for (let cc = 0; cc < cols; cc++) {
-      // Gather the 2x3 pixel block's RGB values (6 subpixels)
-      const px = cc * 2, py = cr * 3;
-      const block: [number, number, number][] = [];
+  // Flat arrays to avoid per-cell allocation of block[] tuples
+  const br = new Int32Array(6), bg_ = new Int32Array(6), bb = new Int32Array(6);
 
+  for (let cr = 0; cr < rows; cr++) {
+    const py = cr * 3;
+    for (let cc = 0; cc < cols; cc++) {
+      // Gather the 2x3 pixel block's RGB values (6 subpixels) into flat arrays
+      const px = cc * 2;
       for (let dy = 0; dy < 3; dy++) {
+        const y = py + dy;
+        const rowOff = y * pixelWidth;
+        const si = dy * 2; // subpixel index 0..5
         for (let dx = 0; dx < 2; dx++) {
-          const x = px + dx, y = py + dy;
+          const x = px + dx;
+          const k = si + dx;
           if (x < pixelWidth && y < pixelHeight) {
-            const i = (y * pixelWidth + x) * 4;
+            const i = (rowOff + x) * 4;
             if (pixels[i + 3] > 0) {
-              block.push([pixels[i], pixels[i + 1], pixels[i + 2]]);
+              br[k] = pixels[i]; bg_[k] = pixels[i + 1]; bb[k] = pixels[i + 2];
             } else {
-              block.push([bgR, bgG, bgB]);
+              br[k] = bgR; bg_[k] = bgG; bb[k] = bgB;
             }
           } else {
-            block.push([bgR, bgG, bgB]);
+            br[k] = bgR; bg_[k] = bgG; bb[k] = bgB;
           }
         }
       }
 
       // Find two most distant colors among the 6 pixels (seed colors)
+      // Unrolled inner loop: 15 comparisons for 6 choose 2
       let maxDist = -1;
       let c1 = 0, c2 = 0;
-      for (let i = 0; i < 6; i++) {
+      for (let i = 0; i < 5; i++) {
         for (let j = i + 1; j < 6; j++) {
-          const d = colorDistSq(block[i][0], block[i][1], block[i][2], block[j][0], block[j][1], block[j][2]);
-          if (d > maxDist) {
-            maxDist = d;
-            c1 = i;
-            c2 = j;
-          }
+          const dr = br[i] - br[j], dg = bg_[i] - bg_[j], db = bb[i] - bb[j];
+          const d = dr * dr + dg * dg + db * db;
+          if (d > maxDist) { maxDist = d; c1 = i; c2 = j; }
         }
       }
 
       // Assign each pixel to the nearer seed → 6-bit pattern
+      const s1r = br[c1], s1g = bg_[c1], s1b = bb[c1];
+      const s2r = br[c2], s2g = bg_[c2], s2b = bb[c2];
       let pattern = 0;
       let g1r = 0, g1g = 0, g1b = 0, g1n = 0;
       let g2r = 0, g2g = 0, g2b = 0, g2n = 0;
       for (let i = 0; i < 6; i++) {
-        const d1 = colorDistSq(block[i][0], block[i][1], block[i][2], block[c1][0], block[c1][1], block[c1][2]);
-        const d2 = colorDistSq(block[i][0], block[i][1], block[i][2], block[c2][0], block[c2][1], block[c2][2]);
-        if (d1 <= d2) {
+        const pr = br[i], pg = bg_[i], pb = bb[i];
+        const dr1 = pr - s1r, dg1 = pg - s1g, db1 = pb - s1b;
+        const dr2 = pr - s2r, dg2 = pg - s2g, db2 = pb - s2b;
+        if (dr1 * dr1 + dg1 * dg1 + db1 * db1 <= dr2 * dr2 + dg2 * dg2 + db2 * db2) {
           pattern |= (1 << i);
-          g1r += block[i][0]; g1g += block[i][1]; g1b += block[i][2]; g1n++;
+          g1r += pr; g1g += pg; g1b += pb; g1n++;
         } else {
-          g2r += block[i][0]; g2g += block[i][1]; g2b += block[i][2]; g2n++;
+          g2r += pr; g2g += pg; g2b += pb; g2n++;
         }
       }
 
-      // Compute average color per group for true representative colors
+      // Compute average color per group
       let r1: number, gg1: number, b1: number, r2: number, gg2: number, b2: number;
       if (g1n > 0) { r1 = g1r / g1n; gg1 = g1g / g1n; b1 = g1b / g1n; }
-      else { r1 = block[c1][0]; gg1 = block[c1][1]; b1 = block[c1][2]; }
+      else { r1 = s1r; gg1 = s1g; b1 = s1b; }
       if (g2n > 0) { r2 = g2r / g2n; gg2 = g2g / g2n; b2 = g2b / g2n; }
-      else { r2 = block[c2][0]; gg2 = block[c2][1]; b2 = block[c2][2]; }
+      else { r2 = s2r; gg2 = s2g; b2 = s2b; }
 
-      // fg = darker color, bg = lighter color (convention for block chars)
+      // fg = darker color, bg = lighter color
       let fgR: number, fgG: number, fgB: number;
       let bgCR: number, bgCG: number, bgCB: number;
-      if (luminance(r1, gg1, b1) <= luminance(r2, gg2, b2)) {
+      if (0.299 * r1 + 0.587 * gg1 + 0.114 * b1 <= 0.299 * r2 + 0.587 * gg2 + 0.114 * b2) {
         fgR = r1; fgG = gg1; fgB = b1;
         bgCR = r2; bgCG = gg2; bgCB = b2;
       } else {

@@ -38,6 +38,7 @@ import { ObjectResolvedEvent } from '../events/ObjectResolvedEvent';
 import { Avatar } from './public/Avatar';
 import type { GenericStreamingMessageMessage } from './messages/GenericStreamingMessage';
 import { LLGLTFMaterialOverride } from './LLGLTFMaterialOverride';
+import { TextureEntry } from './TextureEntry';
 import type * as Long from 'long';
 import { LLSD } from './llsd/LLSD';
 import { LLSDMap } from './llsd/LLSDMap';
@@ -930,10 +931,31 @@ export class ObjectStoreLite implements IObjectStore
             {
                 obj.deleted = false;
                 obj.ID = objData.ID;
+                obj.State = objData.State;
                 obj.FullID = objData.FullID;
                 obj.ParentID = objData.ParentID;
                 obj.OwnerID = objData.OwnerID;
                 obj.PCode = objData.PCode;
+
+                // Parse geometry data (Position, Rotation, etc.) from binary ObjectData
+                obj.Scale = objData.Scale;
+                obj.setObjectData(objData.ObjectData);
+
+                // Copy prim shape parameters
+                obj.PathCurve = objData.PathCurve;
+                obj.ProfileCurve = objData.ProfileCurve;
+                obj.PathBegin = Utils.unpackBeginCut(objData.PathBegin);
+                obj.PathEnd = Utils.unpackEndCut(objData.PathEnd);
+                obj.PathTwist = Utils.unpackPathTwist(objData.PathTwist);
+                obj.PathTwistBegin = Utils.unpackPathTwist(objData.PathTwistBegin);
+                obj.PathTaperX = Utils.unpackPathTaper(objData.PathTaperX);
+                obj.PathTaperY = Utils.unpackPathTaper(objData.PathTaperY);
+                obj.ProfileHollow = Utils.unpackProfileHollow(objData.ProfileHollow);
+                obj.ProfileBegin = Utils.unpackBeginCut(objData.ProfileBegin);
+                obj.ProfileEnd = Utils.unpackEndCut(objData.ProfileEnd);
+
+                // Parse texture entry for colors
+                try { obj.TextureEntry = TextureEntry.from(objData.TextureEntry); } catch {}
 
                 obj.NameValue = this.parseNameValues(Utils.BufferToStringSimple(objData.NameValue));
 
@@ -1201,10 +1223,16 @@ export class ObjectStoreLite implements IObjectStore
             this.objectsByUUID.set(fullID.toString(), localID);
             o.FullID = fullID;
 
-
-            pos++;
-
-            pos = pos + 42;
+            o.State = buf.readUInt8(pos++);
+            // CRC(4) + Material(1) + ClickAction(1) = 6 bytes
+            pos = pos + 6;
+            // Scale(12) + Position(12) + Rotation(12) = 36 bytes
+            o.Scale = new Vector3(buf, pos, false);
+            pos = pos + 12;
+            o.Position = new Vector3(buf, pos, false);
+            pos = pos + 12;
+            o.Rotation = new Quaternion(buf, pos);
+            pos = pos + 12;
             const compressedflags: CompressedFlags = buf.readUInt32LE(pos);
             pos = pos + 4;
             o.OwnerID = new UUID(buf, pos);
@@ -1270,7 +1298,7 @@ export class ObjectStoreLite implements IObjectStore
             }
             if (compressedflags & CompressedFlags.Tree)
             {
-                pos++;
+                o.TreeSpecies = buf.readUInt8(pos++);
             }
             else if (compressedflags & CompressedFlags.ScratchPad)
             {
@@ -1312,15 +1340,33 @@ export class ObjectStoreLite implements IObjectStore
                 o.NameValue = this.parseNameValues(result.result);
                 pos += result.readLength;
             }
-            pos++;
-            pos = pos + 22;
+            // Parse prim shape params from compressed data
+            try {
+            o.PathCurve = buf.readUInt8(pos++);
+            o.PathBegin = Utils.unpackBeginCut(buf.readUInt16LE(pos)); pos += 2;
+            o.PathEnd = Utils.unpackEndCut(buf.readUInt16LE(pos)); pos += 2;
+            pos += 2; // PathScaleX, PathScaleY (skip)
+            pos += 2; // PathShearX, PathShearY (skip)
+            o.PathTwist = Utils.unpackPathTwist(buf.readUInt8(pos++));
+            o.PathTwistBegin = Utils.unpackPathTwist(buf.readUInt8(pos++));
+            pos++; // PathRadiusOffset
+            o.PathTaperX = Utils.unpackPathTaper(buf.readUInt8(pos++));
+            o.PathTaperY = Utils.unpackPathTaper(buf.readUInt8(pos++));
+            pos++; // PathRevolutions
+            pos++; // PathSkew
+            o.ProfileCurve = buf.readUInt8(pos++);
+            o.ProfileBegin = Utils.unpackBeginCut(buf.readUInt16LE(pos)); pos += 2;
+            o.ProfileEnd = Utils.unpackEndCut(buf.readUInt16LE(pos)); pos += 2;
+            o.ProfileHollow = Utils.unpackProfileHollow(buf.readUInt16LE(pos)); pos += 2;
             const textureEntryLength = buf.readUInt32LE(pos);
             pos = pos + 4;
+            try { o.TextureEntry = TextureEntry.from(buf.subarray(pos, pos + textureEntryLength)); } catch {}
             pos = pos + textureEntryLength;
             if (compressedflags & CompressedFlags.TextureAnimation)
             {
                 pos = pos + 4;
             }
+            } catch { /* buffer overrun — shape data unavailable for this object */ }
 
             o.IsAttachment = (compressedflags & CompressedFlags.HasNameValues) !== 0 && o.ParentID !== 0;
             if (o.IsAttachment && o.State !== undefined)

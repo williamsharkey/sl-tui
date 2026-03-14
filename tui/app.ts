@@ -9,6 +9,7 @@ import {
   renderStatusBar, renderSeparator,
   renderChatLines, renderInputLine, renderFpView, renderMinimap,
   renderFpViewBuf, renderFpDeltaBuf, renderMinimapBuf, renderStatusBarBuf,
+  SYNC_START, SYNC_END,
 } from './renderer.js';
 import { InputHandler, type Mode } from './input.js';
 import { ChatBuffer } from './chat-buffer.js';
@@ -17,6 +18,7 @@ import {
   loginFieldAppend, loginFieldBackspace, type LoginState,
 } from './login-screen.js';
 import { MenuPanel } from './menu.js';
+import { generateProceduralClouds, type CloudParams } from '../server/cloud-cache.js';
 
 export interface TUIAppOptions {
   bridge: ISLBridge;
@@ -52,10 +54,25 @@ export class TUIApp {
   private chatBubbles = new Map<string, ChatBubble>();
   private menu: MenuPanel;
   private terrainTexture = false;
+  private cloudsEnabled = false;
+  private cloudTime = 0;
+  private cloudTexture = generateProceduralClouds(128, 128);
+  private cameraMode: 'first-person' | 'third-person' = 'first-person';
+  private cameraOrbitYaw = 0;    // radians offset from behind-avatar
+  private cameraOrbitPitch = 0;  // radians offset from default pitch
+  private lastCameraInputTs = 0; // for auto-return timer
   private autoLogin?: { firstName: string; lastName: string; password: string };
   private createBridge?: () => ISLBridge;
   private onLoginSuccess?: (firstName: string, lastName: string, password: string) => void;
   private onLogout?: () => void;
+  // Speculative login: start connecting with saved credentials while user sees login screen
+  // Stores the promise regardless of outcome so attemptLogin can reuse the result/error
+  private specLogin: {
+    promise: Promise<{ region: string; waterHeight: number }>;
+    firstName: string;
+    lastName: string;
+    password: string;
+  } | null = null;
 
   constructor(opts: TUIAppOptions) {
     this.bridge = opts.bridge;
@@ -101,6 +118,7 @@ export class TUIApp {
         dither: this.ditherEnabled,
         flying: this.bridge.flying,
         terrainTexture: this.terrainTexture,
+        clouds: this.cloudsEnabled,
       }),
       toggleSetting: (key: string) => {
         if (key === 'renderMode') {
@@ -120,6 +138,10 @@ export class TUIApp {
           this.terrainTexture = !this.terrainTexture;
           this.prevFpFrame = null;
           this.chatBuffer.addSystem(`Terrain texture ${this.terrainTexture ? 'ON' : 'OFF'}`);
+        } else if (key === 'clouds') {
+          this.cloudsEnabled = !this.cloudsEnabled;
+          this.prevFpFrame = null;
+          this.chatBuffer.addSystem(`Clouds ${this.cloudsEnabled ? 'ON' : 'OFF'}`);
         }
         this.renderChat();
       },
@@ -147,6 +169,26 @@ export class TUIApp {
       onToggleFly: () => {
         this.bridge.setFlying(!this.bridge.flying);
         this.renderStatus();
+      },
+      onToggleCameraMode: () => {
+        this.cameraMode = this.cameraMode === 'first-person' ? 'third-person' : 'first-person';
+        this.cameraOrbitYaw = 0;
+        this.cameraOrbitPitch = 0;
+        this.prevFpFrame = null; // force full redraw
+        this.chatBuffer.addSystem(`Camera: ${this.cameraMode}`);
+        this.renderChat();
+      },
+      onCameraOrbit: (dir) => {
+        const YAW_STEP = Math.PI / 16;   // ~11 degrees
+        const PITCH_STEP = Math.PI / 24;  // ~7.5 degrees
+        if (dir === 'left') this.cameraOrbitYaw += YAW_STEP;
+        else if (dir === 'right') this.cameraOrbitYaw -= YAW_STEP;
+        else if (dir === 'up') this.cameraOrbitPitch += PITCH_STEP;
+        else if (dir === 'down') this.cameraOrbitPitch -= PITCH_STEP;
+        // Clamp pitch to reasonable range
+        this.cameraOrbitPitch = Math.max(-Math.PI / 3, Math.min(Math.PI / 6, this.cameraOrbitPitch));
+        this.lastCameraInputTs = Date.now();
+        this.prevFpFrame = null; // force full redraw for orbit change
       },
       onEnterChat: () => {
         this.mode = 'chat-input';
@@ -210,6 +252,39 @@ export class TUIApp {
     });
   }
 
+  private buildCallbacks(): import('./types.js').BridgeCallbacks {
+    return {
+      onChat: (from, message, chatType, fromId) => {
+        this.chatBuffer.add(from, message);
+        this.renderChat();
+        if (fromId) {
+          this.chatBubbles.set(fromId, { message, ts: Date.now() });
+        }
+      },
+      onIM: (from, fromName, message) => {
+        this.chatBuffer.add(`[IM] ${fromName}`, message);
+        this.menu.addIM(from, fromName, message, false);
+        this.renderChat();
+      },
+      onFriendRequest: (from, fromName, message) => {
+        this.chatBuffer.addSystem(`Friend request from ${fromName}: ${message}`);
+        this.renderChat();
+      },
+      onFriendOnline: (name, uuid, online) => {
+        this.chatBuffer.addSystem(`${name} is now ${online ? 'online' : 'offline'}`);
+        this.renderChat();
+      },
+      onTeleportOffer: (from, fromName, message) => {
+        this.chatBuffer.addSystem(`Teleport offer from ${fromName}: ${message}`);
+        this.renderChat();
+      },
+      onDisconnected: (reason) => {
+        this.chatBuffer.addSystem(`Disconnected: ${reason}`);
+        this.renderChat();
+      },
+    };
+  }
+
   async start(): Promise<void> {
     this.running = true;
     enterAltScreen(this.output);
@@ -219,10 +294,25 @@ export class TUIApp {
     }
 
     if (this.autoLogin) {
-      // Pre-fill fields but don't auto-login — user must press Enter
+      // Pre-fill fields
       this.loginState.firstName = this.autoLogin.firstName;
       this.loginState.lastName = this.autoLogin.lastName;
       this.loginState.password = this.autoLogin.password;
+
+      // Start speculative login in the background — user doesn't see it
+      // Only if credentials are valid (non-empty first name and password)
+      const { firstName, lastName, password } = this.autoLogin;
+      if (firstName && password) {
+        const loginPromise = this.bridge.login(firstName, lastName || 'Resident', password, this.buildCallbacks());
+        this.specLogin = {
+          firstName,
+          lastName: lastName || 'Resident',
+          password,
+          promise: loginPromise,
+        };
+        // Prevent unhandled rejection — errors will be handled when user presses Enter
+        loginPromise.catch(() => {});
+      }
     }
     this.inputHandler.setMode('login');
     renderLoginScreen(this.output, this.loginState);
@@ -243,45 +333,38 @@ export class TUIApp {
     // Show loading screen immediately
     renderLoadingScreen(this.output);
 
+    const effectiveLastName = lastName || 'Resident';
+
     try {
-      const result = await this.bridge.login(
-        firstName,
-        lastName || 'Resident',
-        password,
-        {
-          onChat: (from, message, chatType, fromId) => {
-            this.chatBuffer.add(from, message);
-            this.renderChat();
-            if (fromId) {
-              this.chatBubbles.set(fromId, { message, ts: Date.now() });
-            }
-          },
-          onIM: (from, fromName, message) => {
-            this.chatBuffer.add(`[IM] ${fromName}`, message);
-            this.menu.addIM(from, fromName, message, false);
-            this.renderChat();
-          },
-          onFriendRequest: (from, fromName, message) => {
-            this.chatBuffer.addSystem(`Friend request from ${fromName}: ${message}`);
-            this.renderChat();
-          },
-          onFriendOnline: (name, uuid, online) => {
-            this.chatBuffer.addSystem(`${name} is now ${online ? 'online' : 'offline'}`);
-            this.renderChat();
-          },
-          onTeleportOffer: (from, fromName, message) => {
-            this.chatBuffer.addSystem(`Teleport offer from ${fromName}: ${message}`);
-            this.renderChat();
-          },
-          onDisconnected: (reason) => {
-            this.chatBuffer.addSystem(`Disconnected: ${reason}`);
-            this.renderChat();
-          },
+      let loginPromise: Promise<{ region: string; waterHeight: number }>;
+
+      // Check if speculative login matches — reuse the in-progress connection
+      if (
+        this.specLogin &&
+        this.specLogin.firstName === firstName &&
+        this.specLogin.lastName === effectiveLastName &&
+        this.specLogin.password === password
+      ) {
+        loginPromise = this.specLogin.promise;
+        this.specLogin = null;
+      } else {
+        // Credentials changed — abandon speculative login and start fresh
+        if (this.specLogin) {
+          this.specLogin = null;
+          // Close the speculative bridge in background (don't await)
+          this.bridge.close().catch(() => {});
+          // Create a fresh bridge if factory available
+          if (this.createBridge) {
+            this.bridge = this.createBridge();
+          }
         }
-      );
+        loginPromise = this.bridge.login(firstName, effectiveLastName, password, this.buildCallbacks());
+      }
+
+      const result = await loginPromise;
 
       this.regionName = result.region;
-      this.onLoginSuccess?.(firstName, lastName || 'Resident', password);
+      this.onLoginSuccess?.(firstName, effectiveLastName, password);
 
       // Region crossing detection
       this.bridge.onRegionChange(() => {
@@ -294,6 +377,8 @@ export class TUIApp {
 
       this.enterGridMode();
     } catch (err: any) {
+      // If speculative login failed, clear it
+      this.specLogin = null;
       this.loginState.error = `Login failed: ${err.message || err}`;
       renderLoginScreen(this.output, this.loginState);
     } finally {
@@ -309,6 +394,9 @@ export class TUIApp {
     // Full initial render
     this.renderFull();
 
+    // Retrieve offline messages (SL delivers them as normal IM events)
+    this.bridge.retrieveOfflineMessages?.().catch(() => {});
+
     // Start tick loop — 15Hz for smooth interpolation
     this.tickInterval = setInterval(() => this.tick(), 66);
   }
@@ -319,6 +407,7 @@ export class TUIApp {
     const pos = this.bridge.getPosition();
     if (!pos) return;
 
+    try {
     const avatars = this.bridge.getAvatars();
     const objects = this.bridge.getObjects();
     const waterHeight = this.bridge.getWaterHeight();
@@ -332,8 +421,18 @@ export class TUIApp {
     this.bridge.tickFlyTo();
     this.bridge.triggerAvatarMeshScan();
 
-    // Prune expired chat bubbles (>10s)
+    // Auto-return camera orbit to center after 4s of no input
     const now = Date.now();
+    if (now - this.lastCameraInputTs > 4000 &&
+        (Math.abs(this.cameraOrbitYaw) > 0.01 || Math.abs(this.cameraOrbitPitch) > 0.01)) {
+      this.cameraOrbitYaw *= 0.9;   // decay 10% per tick at 15Hz → ~1.5s settle
+      this.cameraOrbitPitch *= 0.9;
+      if (Math.abs(this.cameraOrbitYaw) < 0.01) this.cameraOrbitYaw = 0;
+      if (Math.abs(this.cameraOrbitPitch) < 0.01) this.cameraOrbitPitch = 0;
+      this.prevFpFrame = null; // force redraw during decay
+    }
+
+    // Prune expired chat bubbles (>10s)
     for (const [uuid, bubble] of this.chatBubbles) {
       if (now - bubble.ts > 10000) this.chatBubbles.delete(uuid);
     }
@@ -353,6 +452,9 @@ export class TUIApp {
     if (this.ditherEnabled) {
       this.ditherPhase += 0.15; // smooth flow speed
     }
+    if (this.cloudsEnabled) {
+      this.cloudTime += 1 / 15; // 15Hz tick → seconds
+    }
 
     // Main view: first-person perspective (full width, full FP area)
     if (this.layout.fpRows > 0) {
@@ -360,14 +462,43 @@ export class TUIApp {
         terrainFn,
         avatars,
         objects,
-        { selfX: pos.x, selfY: pos.y, selfZ: pos.z, yaw: selfYaw, waterHeight,
+        { selfX: pos.x, selfY: pos.y, selfZ: pos.z + 1.8, yaw: selfYaw, waterHeight,
+          flying: this.bridge.flying,
+          terrainHeight: terrainFn(Math.floor(pos.x), Math.floor(pos.y)),
           ditherPhase: this.ditherEnabled ? this.ditherPhase : undefined,
           meshLookup: (uuid: string) => this.bridge.getAvatarMeshBundle(uuid),
+          appearanceLookup: (uuid: string) => (this.bridge as any).getAvatarAppearance?.(uuid) ?? null,
+          bakedColorsLookup: (uuid: string) => (this.bridge as any).getAvatarBakedColors?.(uuid) ?? null,
+          sceneMeshLookup: (uuid: string) => (this.bridge as any).getSceneMesh?.(uuid) ?? null,
+          sceneMeshTrigger: (uuids: string[]) => (this.bridge as any).triggerSceneMeshFetch?.(uuids),
           avatarNames: avatarNameMap,
           chatBubbles: this.chatBubbles,
           skyColors: this.bridge.getSkyColors() ?? undefined,
+          sunDir: this.bridge.getSkyColors()?.sunDir ?? undefined,
           renderMode: this.renderMode,
-          terrainTexture: this.terrainTexture },
+          terrainTexture: this.terrainTexture,
+          cameraMode: this.cameraMode,
+          cameraOrbitYaw: this.cameraOrbitYaw,
+          cameraOrbitPitch: this.cameraOrbitPitch,
+          selfAvatarPos: { x: pos.x, y: pos.y, z: pos.z },
+          ...(this.cloudsEnabled ? {
+            cloudParams: (() => {
+              const cp = (this.bridge as any).getCloudParams?.();
+              return {
+                texture: this.cloudTexture,
+                scrollRateX: cp?.scrollRateX ?? 0.05,
+                scrollRateY: cp?.scrollRateY ?? 0.03,
+                density1Z: cp?.density1Z ?? 0.5,
+                density2Z: cp?.density2Z ?? 0.3,
+                scale: cp?.scale ?? 0.4,
+                shadow: cp?.shadow ?? 0.5,
+                colorR: cp?.colorR ?? 240,
+                colorG: cp?.colorG ?? 240,
+                colorB: cp?.colorB ?? 245,
+              } as CloudParams;
+            })(),
+            cloudTime: this.cloudTime,
+          } : {}) },
         this.layout.fpCols,
         this.layout.fpRows,
       );
@@ -421,28 +552,36 @@ export class TUIApp {
     // Status bar — only update when values change
     const statusStr = this.buildStatusString(pos);
     if (statusStr !== this.lastStatusStr) {
-      buf += renderStatusBarBuf(this.layout, this.regionName || this.bridge.getRegionName(), pos, this.bridge.flying);
+      buf += renderStatusBarBuf(this.layout, this.regionName || this.bridge.getRegionName(), pos, this.bridge.flying, this.menu.getUnreadSummary());
       this.lastStatusStr = statusStr;
     }
 
-    // Single write for the entire tick
+    // Single write for the entire tick, wrapped in synchronized output markers
+    // to prevent horizontal tearing from partial terminal updates
     if (buf) {
-      this.output.write(buf);
+      this.output.write(SYNC_START + buf + SYNC_END);
+    }
+    } catch (err: any) {
+      // Log tick errors to chat instead of crashing
+      this.chatBuffer.addSystem(`Render error: ${err.message || err}`);
+      this.renderChat();
     }
   }
 
   private renderFull(): void {
-    this.output.write('\x1b[2J'); // clear
+    this.output.write(SYNC_START + '\x1b[2J'); // clear + start sync
     this.renderStatus();
-    this.tick(); // renders grid
+    this.tick(); // renders grid (tick also wraps its write in SYNC_START/END but that's harmless nested)
     renderSeparator(this.output, this.layout);
     this.renderChat();
     this.renderInputBar();
+    this.output.write(SYNC_END);
   }
 
   private buildStatusString(pos: { x: number; y: number; z: number }): string {
     const region = this.regionName || this.bridge.getRegionName();
-    return `${region}|${pos.x.toFixed(0)},${pos.y.toFixed(0)},${pos.z.toFixed(0)}|${this.bridge.flying}`;
+    const imSummary = this.menu.getUnreadSummary() ?? '';
+    return `${region}|${pos.x.toFixed(0)},${pos.y.toFixed(0)},${pos.z.toFixed(0)}|${this.bridge.flying}|${imSummary}`;
   }
 
   private renderStatus(): void {

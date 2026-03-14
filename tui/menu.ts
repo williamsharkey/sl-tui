@@ -37,7 +37,7 @@ export interface MenuActions {
   stand: () => void;
   closeMenu: () => void;
   systemMessage: (msg: string) => void;
-  getSettings?: () => { renderMode: string; dither: boolean; flying: boolean; terrainTexture: boolean };
+  getSettings?: () => { renderMode: string; dither: boolean; flying: boolean; terrainTexture: boolean; clouds: boolean };
   toggleSetting?: (key: string) => void;
 }
 
@@ -111,6 +111,14 @@ export class MenuPanel {
 
   get unreadCount(): number {
     return this.imMessages.filter(m => !m.outgoing && m.ts > this.lastReadTs).length;
+  }
+
+  getUnreadSummary(): string | null {
+    const convs = this.getConversations().filter(c => c.unread > 0);
+    if (convs.length === 0) return null;
+    const top = convs[0]; // most recent
+    const ago = timeAgo(top.lastTs);
+    return `${firstName(top.name)}(${top.unread}msg, ${ago} ago)`;
   }
 
   private push(frame: MenuFrame): void {
@@ -389,7 +397,7 @@ export class MenuPanel {
   }
 
   private handleSettingsKey(str: string | undefined, key: { name?: string }): boolean {
-    const items = ['renderMode', 'dither', 'flying', 'terrainTexture'];
+    const items = ['renderMode', 'dither', 'flying', 'terrainTexture', 'clouds'];
     const sel = this.handleListNav(str, key, items.length);
     if (sel !== null) {
       this.actions.toggleSetting?.(items[sel]);
@@ -576,12 +584,13 @@ export class MenuPanel {
   }
 
   private buildSettings(): { title: string; lines: PanelLine[]; footer: string } {
-    const settings = this.actions.getSettings?.() ?? { renderMode: 'triangle', dither: false, flying: false, terrainTexture: false };
+    const settings = this.actions.getSettings?.() ?? { renderMode: 'triangle', dither: false, flying: false, terrainTexture: false, clouds: false };
     const items = [
       { label: 'Render mode', value: `[${settings.renderMode} >]` },
       { label: 'Dither', value: settings.dither ? '[ON]' : '[OFF]' },
       { label: 'Flying', value: settings.flying ? '[ON]' : '[OFF]' },
       { label: 'Terrain texture', value: settings.terrainTexture ? '[ON]' : '[OFF]' },
+      { label: 'Clouds', value: settings.clouds ? '[ON]' : '[OFF]' },
     ];
     const lines: PanelLine[] = [{ text: '' }];
     for (let i = 0; i < items.length; i++) {

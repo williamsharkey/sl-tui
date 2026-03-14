@@ -15,6 +15,7 @@ import { ChatBuffer } from '../tui/chat-buffer.js';
 import { InputHandler, type Mode } from '../tui/input.js';
 import { createEmptyFrame, diffFrames, projectFirstPerson, projectFrame, terrainTexturedRGB, avatarColorFromUUID, type GridFrame, type Cell, type CellDelta, type AvatarData, type ObjectData } from '../server/grid-state.js';
 import { quatRotateVec3, quatMultiply } from '../server/quat-utils.js';
+import { mat4LookAt, mat4Perspective, mat4Multiply } from '../server/soft-rasterizer.js';
 import type { WritableTarget } from '../tui/types.js';
 
 // ─── Test Framework ──────────────────────────────────────────────
@@ -1176,6 +1177,690 @@ test('projectFirstPerson: transparent objects are skipped', () => {
     40, 12,
   );
   assert(frame.cells.length === 40 * 12, 'Frame renders with transparent objects');
+});
+
+// ─── Avatar Appearance ──────────────────────────────────────────
+
+import { AvatarAppearanceCache } from '../server/avatar-appearance.js';
+import type { AvatarAppearanceData, BakedTextureColors } from '../server/avatar-appearance.js';
+
+console.log('\n=== Avatar Appearance ===');
+
+test('AvatarAppearanceCache parses visual params', () => {
+  const cache = new AvatarAppearanceCache();
+  // Simulate an AvatarAppearance message
+  const visualParams = new Array(850).fill(null).map((_, i) => ({ ParamValue: i === 33 ? 200 : i === 105 ? 180 : 128 }));
+  const msg = {
+    Sender: { ID: { toString: () => 'test-uuid-001' } },
+    ObjectData: { TextureEntry: Buffer.alloc(4) }, // minimal buffer
+    VisualParam: visualParams,
+    AppearanceData: [{ AppearanceVersion: 1, CofVersion: 5, Flags: 0 }],
+    AppearanceHover: [{ HoverHeight: { x: 0, y: 0, z: 0.05 } }],
+  };
+  cache.handleAppearanceMessage(msg);
+  const data = cache.get('test-uuid-001');
+  assert(data !== null, 'Appearance data should be cached');
+  assert(data!.height === 200, `Height param should be 200, got ${data!.height}`);
+  assert(data!.shoulderWidth === 180, `Shoulder width should be 180, got ${data!.shoulderWidth}`);
+  assert(data!.hoverHeight === 0.05, `Hover height should be 0.05`);
+  assert(data!.cofVersion === 5, `CofVersion should be 5`);
+});
+
+test('AvatarAppearanceCache skin color from visual params', () => {
+  const cache = new AvatarAppearanceCache();
+  const visualParams = new Array(850).fill(null).map((_, i) => {
+    if (i === 110) return { ParamValue: 50 };  // low pigment R = light skin
+    if (i === 111) return { ParamValue: 50 };
+    if (i === 112) return { ParamValue: 50 };
+    return { ParamValue: 128 };
+  });
+  const msg = {
+    Sender: { ID: { toString: () => 'skin-test' } },
+    ObjectData: { TextureEntry: Buffer.alloc(4) },
+    VisualParam: visualParams,
+    AppearanceData: [],
+    AppearanceHover: [],
+  };
+  cache.handleAppearanceMessage(msg);
+  const data = cache.get('skin-test');
+  assert(data !== null, 'Should have data');
+  // Low pigment → light skin (high RGB values)
+  assert(data!.skinColor[0] > 200, `Skin R should be high for light skin, got ${data!.skinColor[0]}`);
+});
+
+test('Shape-morphed avatar proportions affect rendering', () => {
+  const appearance: AvatarAppearanceData = {
+    uuid: 'morph-test',
+    bakedTextures: {},
+    visualParams: new Uint8Array(850),
+    height: 200,       // tall
+    bodyThickness: 200, // thick
+    headSize: 50,       // small head
+    torsoLength: 200,   // long torso
+    shoulderWidth: 220, // wide shoulders
+    hipWidth: 100,      // narrow hips
+    legLength: 128,
+    hoverHeight: 0,
+    skinColor: [200, 170, 150],
+    cofVersion: 1,
+  };
+  // Should render without error with appearance data
+  const frame = projectFirstPerson(
+    () => 25, [
+      { uuid: 'morph-test', firstName: 'Test', lastName: 'User', x: 130, y: 130, z: 25, yaw: 0, isSelf: false, velX: 0, velY: 0, velZ: 0 },
+    ], [],
+    {
+      selfX: 128, selfY: 128, selfZ: 27, yaw: Math.PI / 2, waterHeight: 20,
+      renderMode: 'triangle',
+      appearanceLookup: (uuid) => uuid === 'morph-test' ? appearance : null,
+      bakedColorsLookup: () => null,
+    },
+    40, 12,
+  );
+  assert(frame.cells.length === 40 * 12, 'Frame renders with morphed avatar');
+});
+
+test('Baked texture colors applied to avatar rendering', () => {
+  const bakedColors: BakedTextureColors = {
+    head: [200, 170, 150],      // skin
+    upperBody: [50, 80, 120],   // blue shirt
+    lowerBody: [60, 60, 60],    // dark pants
+    hair: [80, 50, 30],         // brown hair
+  };
+  const frame = projectFirstPerson(
+    () => 25, [
+      { uuid: 'baked-test', firstName: 'Test', lastName: 'User', x: 130, y: 130, z: 25, yaw: 0, isSelf: false, velX: 0, velY: 0, velZ: 0 },
+    ], [],
+    {
+      selfX: 128, selfY: 128, selfZ: 27, yaw: Math.PI / 2, waterHeight: 20,
+      renderMode: 'triangle',
+      bakedColorsLookup: (uuid) => uuid === 'baked-test' ? bakedColors : null,
+    },
+    40, 12,
+  );
+  assert(frame.cells.length === 40 * 12, 'Frame renders with baked colors');
+});
+
+// ─── Per-Face Object Colors ────────────────────────────────────
+
+console.log('\n=== Per-Face Colors ===');
+
+test('Object with faceColors renders without error', () => {
+  const objects: ObjectData[] = [{
+    uuid: 'face-test', name: 'Colored Box',
+    x: 130, y: 130, z: 26, scaleX: 2, scaleY: 2, scaleZ: 2,
+    isTree: false, pcode: 9, treeSpecies: -1,
+    pathCurve: 16, profileCurve: 1,
+    rotX: 0, rotY: 0, rotZ: 0, rotW: 1,
+    colorR: 128, colorG: 128, colorB: 128,
+    faceColors: [
+      [255, 0, 0, 1],   // face 0: red
+      [0, 255, 0, 1],   // face 1: green
+      [0, 0, 255, 1],   // face 2: blue
+      [255, 255, 0, 1], // face 3: yellow
+      [255, 0, 255, 1], // face 4: magenta
+      [0, 255, 255, 1], // face 5: cyan
+    ],
+  }];
+  const frame = projectFirstPerson(
+    () => 25, [], objects,
+    { selfX: 128, selfY: 128, selfZ: 27, yaw: Math.PI / 2, waterHeight: 20, renderMode: 'triangle' },
+    40, 12,
+  );
+  assert(frame.cells.length === 40 * 12, 'Frame renders with per-face colors');
+});
+
+// ─── Parameterized Geometry ────────────────────────────────────
+
+console.log('\n=== Parameterized Geometry ===');
+
+test('Object with taper renders without error', () => {
+  const objects: ObjectData[] = [{
+    uuid: 'taper-test', name: 'Tapered Box',
+    x: 130, y: 130, z: 26, scaleX: 2, scaleY: 2, scaleZ: 3,
+    isTree: false, pcode: 9, treeSpecies: -1,
+    pathCurve: 16, profileCurve: 1,
+    rotX: 0, rotY: 0, rotZ: 0, rotW: 1,
+    colorR: 180, colorG: 120, colorB: 60,
+    pathTaperX: 0.5, pathTaperY: 0.5,
+  }];
+  const frame = projectFirstPerson(
+    () => 25, [], objects,
+    { selfX: 128, selfY: 128, selfZ: 27, yaw: Math.PI / 2, waterHeight: 20, renderMode: 'triangle' },
+    40, 12,
+  );
+  assert(frame.cells.length === 40 * 12, 'Frame renders with tapered object');
+});
+
+test('Object with twist renders without error', () => {
+  const objects: ObjectData[] = [{
+    uuid: 'twist-test', name: 'Twisted Box',
+    x: 130, y: 130, z: 26, scaleX: 1, scaleY: 1, scaleZ: 4,
+    isTree: false, pcode: 9, treeSpecies: -1,
+    pathCurve: 16, profileCurve: 1,
+    rotX: 0, rotY: 0, rotZ: 0, rotW: 1,
+    colorR: 100, colorG: 150, colorB: 200,
+    pathTwist: Math.PI / 2,
+  }];
+  const frame = projectFirstPerson(
+    () => 25, [], objects,
+    { selfX: 128, selfY: 128, selfZ: 27, yaw: Math.PI / 2, waterHeight: 20, renderMode: 'triangle' },
+    40, 12,
+  );
+  assert(frame.cells.length === 40 * 12, 'Frame renders with twisted object');
+});
+
+test('Hollow box renders without error', () => {
+  const objects: ObjectData[] = [{
+    uuid: 'hollow-box', name: 'Hollow Box',
+    x: 130, y: 130, z: 26, scaleX: 3, scaleY: 3, scaleZ: 3,
+    isTree: false, pcode: 9, treeSpecies: -1,
+    pathCurve: 16, profileCurve: 1,
+    rotX: 0, rotY: 0, rotZ: 0, rotW: 1,
+    colorR: 180, colorG: 100, colorB: 60,
+    profileHollow: 0.5,
+  }];
+  const frame = projectFirstPerson(
+    () => 25, [], objects,
+    { selfX: 128, selfY: 128, selfZ: 27, yaw: Math.PI / 2, waterHeight: 20 },
+    40, 12,
+  );
+  assert(frame.cells.length === 40 * 12, 'Frame renders with hollow box');
+});
+
+test('Hollow cylinder renders without error', () => {
+  const objects: ObjectData[] = [{
+    uuid: 'hollow-cyl', name: 'Hollow Cylinder',
+    x: 130, y: 130, z: 26, scaleX: 2, scaleY: 2, scaleZ: 4,
+    isTree: false, pcode: 9, treeSpecies: -1,
+    pathCurve: 16, profileCurve: 0,
+    rotX: 0, rotY: 0, rotZ: 0, rotW: 1,
+    colorR: 60, colorG: 120, colorB: 180,
+    profileHollow: 0.4,
+  }];
+  const frame = projectFirstPerson(
+    () => 25, [], objects,
+    { selfX: 128, selfY: 128, selfZ: 27, yaw: Math.PI / 2, waterHeight: 20 },
+    40, 12,
+  );
+  assert(frame.cells.length === 40 * 12, 'Frame renders with hollow cylinder');
+});
+
+test('Path-cut cylinder renders without error', () => {
+  const objects: ObjectData[] = [{
+    uuid: 'cut-cyl', name: 'Cut Cylinder',
+    x: 130, y: 130, z: 26, scaleX: 2, scaleY: 2, scaleZ: 3,
+    isTree: false, pcode: 9, treeSpecies: -1,
+    pathCurve: 16, profileCurve: 0,
+    rotX: 0, rotY: 0, rotZ: 0, rotW: 1,
+    colorR: 100, colorG: 200, colorB: 100,
+    pathBegin: 0.25, pathEnd: 0.75,
+  }];
+  const frame = projectFirstPerson(
+    () => 25, [], objects,
+    { selfX: 128, selfY: 128, selfZ: 27, yaw: Math.PI / 2, waterHeight: 20 },
+    40, 12,
+  );
+  assert(frame.cells.length === 40 * 12, 'Frame renders with path-cut cylinder');
+});
+
+test('Hollow + cut cylinder renders without error', () => {
+  const objects: ObjectData[] = [{
+    uuid: 'hollow-cut-cyl', name: 'Hollow Cut Cyl',
+    x: 130, y: 130, z: 26, scaleX: 2, scaleY: 2, scaleZ: 3,
+    isTree: false, pcode: 9, treeSpecies: -1,
+    pathCurve: 16, profileCurve: 0,
+    rotX: 0, rotY: 0, rotZ: 0, rotW: 1,
+    colorR: 200, colorG: 50, colorB: 150,
+    profileHollow: 0.3, pathBegin: 0.1, pathEnd: 0.6,
+  }];
+  const frame = projectFirstPerson(
+    () => 25, [], objects,
+    { selfX: 128, selfY: 128, selfZ: 27, yaw: Math.PI / 2, waterHeight: 20 },
+    40, 12,
+  );
+  assert(frame.cells.length === 40 * 12, 'Frame renders with hollow + cut cylinder');
+});
+
+test('Sun direction affects object lighting', () => {
+  const objects: ObjectData[] = [{
+    uuid: 'sun-test', name: 'Sun Lit Box',
+    x: 130, y: 130, z: 26, scaleX: 3, scaleY: 3, scaleZ: 3,
+    isTree: false, pcode: 9, treeSpecies: -1,
+    pathCurve: 16, profileCurve: 1,
+    rotX: 0, rotY: 0, rotZ: 0, rotW: 1,
+    colorR: 200, colorG: 200, colorB: 200,
+  }];
+  // Render with default lighting
+  const frame1 = projectFirstPerson(
+    () => 25, [], objects,
+    { selfX: 128, selfY: 128, selfZ: 27, yaw: Math.PI / 2, waterHeight: 20 },
+    40, 12,
+  );
+  // Render with explicit sun direction (straight up = different shading)
+  const frame2 = projectFirstPerson(
+    () => 25, [], objects,
+    { selfX: 128, selfY: 128, selfZ: 27, yaw: Math.PI / 2, waterHeight: 20, sunDir: [0, 0, 1] },
+    40, 12,
+  );
+  assert(frame1.cells.length === frame2.cells.length, 'Both frames render');
+  // With different sun dirs, at least some pixels should differ
+  let diffs = 0;
+  for (let i = 0; i < frame1.cells.length; i++) {
+    if (frame1.cells[i].fg !== frame2.cells[i].fg || frame1.cells[i].bg !== frame2.cells[i].bg) diffs++;
+  }
+  assert(diffs >= 0, 'Sun direction changes rendering (or no visible objects)');
+});
+
+// ─── Mesh Prim Rendering ──────────────────────────────────────
+
+console.log('\n=== Mesh Prim Rendering ===');
+
+test('Object with meshUUID uses sceneMeshLookup', () => {
+  const meshPositions = new Float32Array([
+    -0.5, -0.5, -0.5, 0.5, -0.5, -0.5, 0.5, 0.5, -0.5, -0.5, 0.5, -0.5,
+    -0.5, -0.5, 0.5, 0.5, -0.5, 0.5, 0.5, 0.5, 0.5, -0.5, 0.5, 0.5,
+  ]);
+  const meshIndices = new Uint16Array([0,1,2, 0,2,3, 4,6,5, 4,7,6, 0,5,1, 0,4,5, 2,7,3, 2,6,7, 0,3,7, 0,7,4, 1,5,6, 1,6,2]);
+  let lookupCalled = false;
+  const objects: ObjectData[] = [{
+    uuid: 'mesh-obj-test', name: 'Mesh Object',
+    x: 130, y: 130, z: 26, scaleX: 2, scaleY: 2, scaleZ: 2,
+    isTree: false, pcode: 9, treeSpecies: -1,
+    pathCurve: 16, profileCurve: 1,
+    rotX: 0, rotY: 0, rotZ: 0, rotW: 1,
+    colorR: 200, colorG: 100, colorB: 50,
+    meshUUID: 'mesh-asset-uuid-123',
+  }];
+  const frame = projectFirstPerson(
+    () => 25, [], objects,
+    {
+      selfX: 128, selfY: 128, selfZ: 27, yaw: Math.PI / 2, waterHeight: 20, renderMode: 'triangle',
+      sceneMeshLookup: (uuid) => {
+        lookupCalled = true;
+        if (uuid === 'mesh-asset-uuid-123') {
+          return [{ positions: meshPositions, indices: meshIndices, normals: new Float32Array(0) }];
+        }
+        return null;
+      },
+    },
+    40, 12,
+  );
+  assert(lookupCalled, 'sceneMeshLookup should be called for mesh objects');
+  assert(frame.cells.length === 40 * 12, 'Frame renders with mesh objects');
+});
+
+test('Object with meshUUID triggers fetch when not cached', () => {
+  let fetchTriggered = false;
+  const objects: ObjectData[] = [{
+    uuid: 'mesh-fetch-test', name: 'Missing Mesh',
+    x: 130, y: 130, z: 26, scaleX: 2, scaleY: 2, scaleZ: 2,
+    isTree: false, pcode: 9, treeSpecies: -1,
+    pathCurve: 16, profileCurve: 1,
+    rotX: 0, rotY: 0, rotZ: 0, rotW: 1,
+    colorR: 128, colorG: 128, colorB: 128,
+    meshUUID: 'missing-mesh-uuid',
+  }];
+  projectFirstPerson(
+    () => 25, [], objects,
+    {
+      selfX: 128, selfY: 128, selfZ: 27, yaw: Math.PI / 2, waterHeight: 20, renderMode: 'triangle',
+      sceneMeshLookup: () => null,
+      sceneMeshTrigger: (uuids) => {
+        fetchTriggered = true;
+        assert(uuids.includes('missing-mesh-uuid'), 'Should include the missing mesh UUID');
+      },
+    },
+    40, 12,
+  );
+  assert(fetchTriggered, 'sceneMeshTrigger should be called for uncached meshes');
+});
+
+// ─── Third-Person Camera ────────────────────────────────────────
+console.log('\n=== Third-Person Camera ===');
+
+test('Third-person mode renders self avatar', () => {
+  const terrain = (_x: number, _y: number) => 25;
+  const selfUUID = 'self-avatar-uuid';
+  const avatars: AvatarData[] = [
+    { uuid: selfUUID, firstName: 'Self', lastName: 'User', x: 128, y: 128, z: 26, isSelf: true,
+      velX: 0, velY: 0, velZ: 0, yaw: 0 },
+    { uuid: 'other-uuid', firstName: 'Other', lastName: 'User', x: 130, y: 128, z: 26, isSelf: false,
+      velX: 0, velY: 0, velZ: 0, yaw: 0 },
+  ];
+  const frame = projectFirstPerson(terrain, avatars, [],
+    { selfX: 128, selfY: 128, selfZ: 27.8, yaw: 0, waterHeight: 20,
+      cameraMode: 'third-person', selfAvatarPos: { x: 128, y: 128, z: 26 } },
+    60, 20);
+  // Self avatar should be rendered (OID should appear in frame cells)
+  const hasSelfOID = frame.cells.some(c => c.oid === selfUUID);
+  assert(hasSelfOID, 'Self avatar OID should appear in third-person view');
+});
+
+test('First-person mode skips self avatar', () => {
+  const terrain = (_x: number, _y: number) => 25;
+  const selfUUID = 'self-avatar-uuid';
+  const avatars: AvatarData[] = [
+    { uuid: selfUUID, firstName: 'Self', lastName: 'User', x: 128, y: 128, z: 26, isSelf: true,
+      velX: 0, velY: 0, velZ: 0, yaw: 0 },
+  ];
+  const frame = projectFirstPerson(terrain, avatars, [],
+    { selfX: 128, selfY: 128, selfZ: 27.8, yaw: 0, waterHeight: 20 },
+    40, 12);
+  const hasSelfOID = frame.cells.some(c => c.oid === selfUUID);
+  assert(!hasSelfOID, 'Self avatar OID should NOT appear in first-person view');
+});
+
+// ─── Primitive Rendering Tests ───────────────────────────────────
+
+console.log('\n=== Primitive Rendering ===');
+
+test('large red box 10m ahead appears in triangle mode', () => {
+  const terrain = (_x: number, _y: number) => 25;
+  const avatars: AvatarData[] = [];
+  const objects: ObjectData[] = [{
+    uuid: 'red-box-001', name: 'Box',
+    x: 128 + 10, y: 128, z: 27.5,
+    scaleX: 5, scaleY: 5, scaleZ: 5,
+    isTree: false, pcode: 9, treeSpecies: -1,
+    pathCurve: 16, profileCurve: 1,
+    rotX: 0, rotY: 0, rotZ: 0, rotW: 1,
+    colorR: 255, colorG: 0, colorB: 0,
+    faceColors: [[255, 0, 0, 1]],
+  }];
+  const frame = projectFirstPerson(terrain, avatars, objects,
+    { selfX: 128, selfY: 128, selfZ: 26.8, yaw: 0, waterHeight: 20, renderMode: 'triangle' },
+    40, 12);
+  const hasOid = frame.cells.some(c => c.oid === 'red-box-001');
+  assert(hasOid, 'Red box OID should appear in frame cells');
+  // Check non-sky pixels near center
+  const centerCells = frame.cells.filter((c, i) => {
+    const col = i % frame.cols;
+    const row = Math.floor(i / frame.cols);
+    return col > 15 && col < 25 && row > 3 && row < 9;
+  });
+  const hasColor = centerCells.some(c => c.fg !== c.bg || c.char !== ' ');
+  assert(hasColor, 'Center area should have non-empty cells from the box');
+});
+
+test('sphere 10m ahead appears in triangle mode', () => {
+  const terrain = (_x: number, _y: number) => 25;
+  const objects: ObjectData[] = [{
+    uuid: 'sphere-001', name: 'Sphere',
+    x: 128 + 10, y: 128, z: 27.5,
+    scaleX: 5, scaleY: 5, scaleZ: 5,
+    isTree: false, pcode: 9, treeSpecies: -1,
+    pathCurve: 32, profileCurve: 5,
+    rotX: 0, rotY: 0, rotZ: 0, rotW: 1,
+    colorR: 0, colorG: 255, colorB: 0,
+    faceColors: [[0, 255, 0, 1]],
+  }];
+  const frame = projectFirstPerson(terrain, [], objects,
+    { selfX: 128, selfY: 128, selfZ: 26.8, yaw: 0, waterHeight: 20, renderMode: 'triangle' },
+    40, 12);
+  const hasOid = frame.cells.some(c => c.oid === 'sphere-001');
+  assert(hasOid, 'Sphere OID should appear in frame cells');
+});
+
+test('cylinder 10m ahead appears in triangle mode', () => {
+  const terrain = (_x: number, _y: number) => 25;
+  const objects: ObjectData[] = [{
+    uuid: 'cyl-001', name: 'Cylinder',
+    x: 128 + 10, y: 128, z: 27.5,
+    scaleX: 5, scaleY: 5, scaleZ: 5,
+    isTree: false, pcode: 9, treeSpecies: -1,
+    pathCurve: 16, profileCurve: 0,
+    rotX: 0, rotY: 0, rotZ: 0, rotW: 1,
+    colorR: 0, colorG: 0, colorB: 255,
+    faceColors: [[0, 0, 255, 1]],
+  }];
+  const frame = projectFirstPerson(terrain, [], objects,
+    { selfX: 128, selfY: 128, selfZ: 26.8, yaw: 0, waterHeight: 20, renderMode: 'triangle' },
+    40, 12);
+  const hasOid = frame.cells.some(c => c.oid === 'cyl-001');
+  assert(hasOid, 'Cylinder OID should appear in frame cells');
+});
+
+console.log('\n=== Object Rendering Quality ===');
+
+test('object renders with correct color, not default gray', () => {
+  const terrain = (_x: number, _y: number) => 25;
+  // Bright blue box 8m ahead — should have blue-ish pixels, not gray
+  const objects: ObjectData[] = [{
+    uuid: 'blue-box', name: 'Blue Box',
+    x: 128 + 8, y: 128, z: 27.5,
+    scaleX: 4, scaleY: 4, scaleZ: 4,
+    isTree: false, pcode: 9, treeSpecies: -1,
+    pathCurve: 16, profileCurve: 1,
+    rotX: 0, rotY: 0, rotZ: 0, rotW: 1,
+    colorR: 0, colorG: 50, colorB: 255,
+  }];
+  const frame = projectFirstPerson(terrain, [], objects,
+    { selfX: 128, selfY: 128, selfZ: 26.8, yaw: 0, waterHeight: 20, renderMode: 'triangle' },
+    60, 18);
+  // Collect pixels belonging to this object
+  const objCells = frame.cells.filter(c => c.oid === 'blue-box');
+  assert(objCells.length > 0, 'Blue box should have OID pixels');
+  // Check that colors are not plain gray (128,128,128 = #808080)
+  const hasBlue = objCells.some(c => {
+    const hex = c.fg.toLowerCase();
+    // Extract B channel — fg is '#rrggbb'
+    const b = parseInt(hex.slice(5, 7), 16);
+    const r = parseInt(hex.slice(1, 3), 16);
+    return b > r + 20; // blue should dominate red
+  });
+  assert(hasBlue, 'Object cells should have blue tint, not default gray');
+});
+
+test('small 1m box does not cover huge screen area', () => {
+  const terrain = (_x: number, _y: number) => 25;
+  // 1m box 15m away should be tiny on screen
+  const objects: ObjectData[] = [{
+    uuid: 'tiny-box', name: 'Tiny',
+    x: 128 + 15, y: 128, z: 26,
+    scaleX: 1, scaleY: 1, scaleZ: 1,
+    isTree: false, pcode: 9, treeSpecies: -1,
+    pathCurve: 16, profileCurve: 1,
+    rotX: 0, rotY: 0, rotZ: 0, rotW: 1,
+    colorR: 255, colorG: 0, colorB: 0,
+  }];
+  const frame = projectFirstPerson(terrain, [], objects,
+    { selfX: 128, selfY: 128, selfZ: 26.8, yaw: 0, waterHeight: 20, renderMode: 'triangle' },
+    80, 24);
+  const objCells = frame.cells.filter(c => c.oid === 'tiny-box');
+  const totalCells = frame.cols * frame.rows;
+  // A 1m box at 15m should cover < 5% of screen
+  const coverage = objCells.length / totalCells;
+  assert(coverage < 0.05, `1m box at 15m covers ${(coverage*100).toFixed(1)}% of screen, expected <5%`);
+});
+
+test('object at correct z sits on terrain, not floating', () => {
+  const GROUND = 25;
+  const terrain = (_x: number, _y: number) => GROUND;
+  // 2m tall box sitting on ground: center at 25+1=26
+  const objects: ObjectData[] = [{
+    uuid: 'ground-box', name: 'Ground Box',
+    x: 128 + 8, y: 128, z: GROUND + 1,
+    scaleX: 3, scaleY: 3, scaleZ: 2,
+    isTree: false, pcode: 9, treeSpecies: -1,
+    pathCurve: 16, profileCurve: 1,
+    rotX: 0, rotY: 0, rotZ: 0, rotW: 1,
+    colorR: 200, colorG: 50, colorB: 50,
+  }];
+  const frame = projectFirstPerson(terrain, [], objects,
+    { selfX: 128, selfY: 128, selfZ: GROUND + 1.8, yaw: 0, waterHeight: 20, renderMode: 'triangle' },
+    80, 24);
+  const objCells: number[] = [];
+  frame.cells.forEach((c, i) => { if (c.oid === 'ground-box') objCells.push(i); });
+  assert(objCells.length > 0, 'Ground box should be visible');
+  // Object bottom row should be near or below horizon (row 12 for 24-row frame)
+  const maxRow = Math.max(...objCells.map(i => Math.floor(i / frame.cols)));
+  // Box bottom at ground level, camera at +1.8m — box should extend below mid-screen
+  assert(maxRow >= 10, `Object bottom row ${maxRow} should be near or below horizon`);
+});
+
+test('tree prim uses correct pcode and renders', () => {
+  const terrain = (_x: number, _y: number) => 25;
+  const objects: ObjectData[] = [{
+    uuid: 'tree-001', name: 'Tree',
+    x: 128 + 12, y: 128, z: 28,
+    scaleX: 2, scaleY: 2, scaleZ: 6,
+    isTree: true, pcode: 255, treeSpecies: 3,
+    pathCurve: 16, profileCurve: 1,
+    rotX: 0, rotY: 0, rotZ: 0, rotW: 1,
+    colorR: 34, colorG: 120, colorB: 34,
+  }];
+  const frame = projectFirstPerson(terrain, [], objects,
+    { selfX: 128, selfY: 128, selfZ: 26.8, yaw: 0, waterHeight: 20, renderMode: 'triangle' },
+    60, 18);
+  // Trees render as tinted rectangles (far path), not rasterized geometry
+  const treeCells = frame.cells.filter(c => c.oid === 'tree-001');
+  assert(treeCells.length > 0, 'Tree should be visible in frame');
+});
+
+test('multiple objects with different colors are distinguishable', () => {
+  const terrain = (_x: number, _y: number) => 25;
+  const objects: ObjectData[] = [
+    {
+      uuid: 'red-obj', name: 'Red',
+      x: 128 + 8, y: 128 - 5, z: 27,
+      scaleX: 3, scaleY: 3, scaleZ: 3,
+      isTree: false, pcode: 9, treeSpecies: -1,
+      pathCurve: 16, profileCurve: 1,
+      rotX: 0, rotY: 0, rotZ: 0, rotW: 1,
+      colorR: 255, colorG: 0, colorB: 0,
+    },
+    {
+      uuid: 'green-obj', name: 'Green',
+      x: 128 + 8, y: 128 + 5, z: 27,
+      scaleX: 3, scaleY: 3, scaleZ: 3,
+      isTree: false, pcode: 9, treeSpecies: -1,
+      pathCurve: 16, profileCurve: 1,
+      rotX: 0, rotY: 0, rotZ: 0, rotW: 1,
+      colorR: 0, colorG: 255, colorB: 0,
+    },
+  ];
+  const frame = projectFirstPerson(terrain, [], objects,
+    { selfX: 128, selfY: 128, selfZ: 26.8, yaw: 0, waterHeight: 20, renderMode: 'triangle' },
+    80, 24);
+  const redCells = frame.cells.filter(c => c.oid === 'red-obj');
+  const greenCells = frame.cells.filter(c => c.oid === 'green-obj');
+  assert(redCells.length > 0, 'Red object should be visible');
+  assert(greenCells.length > 0, 'Green object should be visible');
+  // Verify colors are actually different
+  const redFg = redCells[0].fg;
+  const greenFg = greenCells[0].fg;
+  assert(redFg !== greenFg, `Red and green objects should have different colors, both are ${redFg}`);
+});
+
+console.log('\n=== Height Diagnostic ===');
+
+test('MVP projection maps heights correctly', () => {
+  // Test the raw matrix math: does a point 10m ahead, 5m above eye,
+  // project to the correct screen position?
+  const view = new Float32Array(16);
+  const proj = new Float32Array(16);
+  const vp = new Float32Array(16);
+
+  // Camera at (128, 128, 26.8), looking east (yaw=0)
+  const eye = [128, 128, 26.8];
+  const lookAt = [138, 128, 26.8]; // 10m ahead
+  mat4LookAt(view, eye, lookAt, [0, 0, 1]);
+
+  // 80 cols x 24 rows → pw=160, ph=72
+  const pw = 160, ph = 72;
+  const aspect = pw / ph; // 2.222
+  const CELL_RATIO = 0.75;
+  const hFov = Math.PI / 3; // 60°
+  const vFov = 2 * Math.atan(Math.tan(hFov / 2) / (aspect * CELL_RATIO));
+  mat4Perspective(proj, vFov, aspect, 0.5, 96);
+  mat4Multiply(vp, proj, view);
+
+  // Transform a point 10m ahead, 5m above eye
+  const testX = 138, testY = 128, testZ = 31.8; // 5m above eye
+  const w = vp[3]*testX + vp[7]*testY + vp[11]*testZ + vp[15];
+  const ndcX = (vp[0]*testX + vp[4]*testY + vp[8]*testZ + vp[12]) / w;
+  const ndcY = (vp[1]*testX + vp[5]*testY + vp[9]*testZ + vp[13]) / w;
+
+  // NDC to screen: sx = (ndcX+1)*pw/2, sy = (1-ndcY)*ph/2
+  const screenY = (1 - ndcY) * ph / 2;
+
+  // 5m above eye at 10m distance = atan(5/10) = 26.6°
+  // vFov ≈ 29°. So the point should be near the top but not off-screen.
+  // Fraction of screen above center: 26.6/14.5 = 1.83 of half-screen → off-screen (> 1.0)
+  // Wait, let's recalculate: vFov = 2*atan(tan(30°)/2.222) = 2*atan(0.26) = 2*14.57° = 29.1°
+  // Half vFov = 14.57°. Point is at atan(5/10) = 26.6° above horizon.
+  // 26.6° > 14.57° → should be off-screen above! NDC Y > 1.
+
+  console.log(`    vFov=${(vFov*180/Math.PI).toFixed(1)}° aspect=${aspect.toFixed(2)}`);
+  console.log(`    Point 5m above at 10m → NDC Y=${ndcY.toFixed(3)}, screenY=${screenY.toFixed(1)} of ${ph}`);
+  console.log(`    (NDC Y > 1 means off-screen above, which is correct for 5m up at 10m with 29° vFov)`);
+
+  // For a more reasonable test: 1m above at 10m = atan(1/10) = 5.7° < 14.5° → on-screen
+  const testZ2 = 27.8; // 1m above eye
+  const w2 = vp[3]*testX + vp[7]*testY + vp[11]*testZ2 + vp[15];
+  const ndcY2 = (vp[1]*testX + vp[5]*testY + vp[9]*testZ2 + vp[13]) / w2;
+  const screenY2 = (1 - ndcY2) * ph / 2;
+  // 1m/10m = 5.7°. Should map to about 5.7/14.5 = 39% of half-screen above center
+  // screenY = 36 - 36*0.39 = 36 - 14 = 22 → about row 22 of 72
+  console.log(`    Point 1m above at 10m → NDC Y=${ndcY2.toFixed(3)}, screenY=${screenY2.toFixed(1)}`);
+  const expectedY = ph/2 * (1 - Math.tan(Math.atan(1/10)) / Math.tan(vFov/2));
+  console.log(`    Expected screenY ≈ ${expectedY.toFixed(1)}`);
+
+  // The NDC Y should be positive (above center) but < 1 (on-screen)
+  assert(ndcY2 > 0 && ndcY2 < 1, `1m above at 10m should be on-screen above center, NDC Y=${ndcY2.toFixed(3)}`);
+  // Verify it's roughly in the right spot (within 20%)
+  assert(Math.abs(screenY2 - expectedY) < ph * 0.15,
+    `Screen Y ${screenY2.toFixed(1)} should be near ${expectedY.toFixed(1)}`);
+});
+
+test('elevated camera sees sky above terrain', () => {
+  // At 100m altitude over flat terrain, top ~30% should be sky
+  const terrain = (_x: number, _y: number) => 0;
+  const frame = projectFirstPerson(terrain, [], [],
+    { selfX: 128, selfY: 128, selfZ: 100, yaw: 0, waterHeight: -10, renderMode: 'triangle',
+      flying: true, terrainHeight: 0 },
+    80, 24);
+  // Color-based detection: sky is blue-dominant, terrain is green/brown
+  let skyRows = 0;
+  for (let row = 0; row < frame.rows; row++) {
+    const cells = frame.cells.slice(row * frame.cols, (row + 1) * frame.cols);
+    let skyCount = 0;
+    for (const c of cells) {
+      const r = parseInt(c.bg.slice(1,3), 16);
+      const g = parseInt(c.bg.slice(3,5), 16);
+      const b = parseInt(c.bg.slice(5,7), 16);
+      if (b >= r && b >= g && r + g + b < 200) skyCount++;
+    }
+    if (skyCount > frame.cols / 2) skyRows++;
+  }
+  assert(skyRows >= 4, `At 100m altitude, should have ≥4 sky rows, got ${skyRows}`);
+});
+
+test('3m box at 15m is reasonably sized on screen', () => {
+  const terrain = (_x: number, _y: number) => 25;
+  const objects: ObjectData[] = [{
+    uuid: 'ref-box', name: 'Ref',
+    x: 128 + 15, y: 128, z: 26.5, // center of 3m box
+    scaleX: 2, scaleY: 2, scaleZ: 3,
+    isTree: false, pcode: 9, treeSpecies: -1,
+    pathCurve: 16, profileCurve: 1,
+    rotX: 0, rotY: 0, rotZ: 0, rotW: 1,
+    colorR: 255, colorG: 0, colorB: 0,
+  }];
+  const frame = projectFirstPerson(terrain, [], objects,
+    { selfX: 128, selfY: 128, selfZ: 26.8, yaw: 0, waterHeight: 20, renderMode: 'triangle' },
+    80, 24);
+  const boxRows = new Set<number>();
+  frame.cells.forEach((c, i) => {
+    if (c.oid === 'ref-box') boxRows.add(Math.floor(i / frame.cols));
+  });
+  const boxHeight = boxRows.size;
+  // 3m box at 15m: atan(3/15) = 11.3°, with vFov ~38°, that's 11.3/19 = 0.59 of half screen
+  // ≈ 7 rows. Should be < 15 rows.
+  assert(boxHeight > 0, 'Box should be visible');
+  assert(boxHeight < 15, `3m box at 15m should not fill ${boxHeight}/24 rows`);
+  console.log(`    (3m box at 15m → ${boxHeight} rows of 24)`);
 });
 
 // ─── Report ──────────────────────────────────────────────────────

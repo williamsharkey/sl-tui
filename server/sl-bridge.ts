@@ -8,6 +8,10 @@ import { ControlFlags } from '../vendor/node-metaverse/enums/ControlFlags.js';
 import { UUID } from '../vendor/node-metaverse/classes/UUID.js';
 import { Vector3 } from '../vendor/node-metaverse/classes/Vector3.js';
 import { ChatType } from '../vendor/node-metaverse/enums/ChatType.js';
+import { Message } from '../vendor/node-metaverse/enums/Message.js';
+import { PacketFlags } from '../vendor/node-metaverse/enums/PacketFlags.js';
+import { RetrieveInstantMessagesMessage } from '../vendor/node-metaverse/classes/messages/RetrieveInstantMessages.js';
+import { SculptType } from '../vendor/node-metaverse/enums/SculptType.js';
 import type { ChatEvent } from '../vendor/node-metaverse/events/ChatEvent.js';
 import type { InstantMessageEvent } from '../vendor/node-metaverse/events/InstantMessageEvent.js';
 import type { FriendRequestEvent } from '../vendor/node-metaverse/events/FriendRequestEvent.js';
@@ -20,6 +24,9 @@ import type { AvatarData, ObjectData } from './grid-state.js';
 import type { Subscription } from 'rxjs';
 import { AvatarCache } from './avatar-cache.js';
 import type { AvatarMeshBundle } from './avatar-cache.js';
+import { AvatarAppearanceCache } from './avatar-appearance.js';
+import type { AvatarAppearanceData, BakedTextureColors } from './avatar-appearance.js';
+import { MeshCache } from './mesh-cache.js';
 
 export interface BridgeCallbacks {
   onChat: (from: string, message: string, chatType: number, fromId: string) => void;
@@ -39,6 +46,9 @@ export class SLBridge {
   private _flying = false;
   private avatarCache = new AvatarCache();
   private _avatarScanAge = 0;
+  private appearanceCache = new AvatarAppearanceCache();
+  private meshCache = new MeshCache();
+  private _appearanceScanAge = 0;
 
   // Caches to avoid per-tick allocations and redundant work
   private _selfId: string = '';
@@ -55,6 +65,7 @@ export class SLBridge {
   private _lastServerUpdate = 0;
   private _lastPosTime = 0;
   private _activeMove: string | null = null; // current movement direction for dead reckoning
+  private _moveStopTime = 0; // when movement stopped (for deceleration ramp)
 
   async login(firstName: string, lastName: string, password: string, callbacks: BridgeCallbacks): Promise<{ region: string; waterHeight: number }> {
     const params = new LoginParameters();
@@ -65,7 +76,7 @@ export class SLBridge {
     params.agreeToTOS = true;
     params.readCritical = true;
 
-    this.bot = new Bot(params, BotOptionFlags.StoreMyAttachmentsOnly);
+    this.bot = new Bot(params, BotOptionFlags.LiteObjectStore);
 
     await this.bot.login();
 
@@ -96,8 +107,28 @@ export class SLBridge {
     this._selfId = this.bot.agent.agentID.toString();
     this._lastRegionName = region.regionName;
 
-    // Attach avatar mesh cache
+    // Attach avatar mesh cache and mesh cache
     this.avatarCache.attach(this.bot);
+    this.meshCache.attach(this.bot);
+
+    // Subscribe to AvatarAppearance messages for visual params + baked textures
+    try {
+      const circuit = this.bot.currentRegion.circuit;
+      this.subscriptions.push(
+        circuit.subscribeToMessages([Message.AvatarAppearance], (packet: any) => {
+          this.appearanceCache.handleAppearanceMessage(packet.message);
+          // Trigger baked texture download in background
+          const msg = packet.message;
+          const uuid = msg.Sender?.ID?.toString();
+          if (uuid && this.bot) {
+            const data = this.appearanceCache.get(uuid);
+            if (data) {
+              this.appearanceCache.downloadBakedColors(this.bot, data).catch(() => {});
+            }
+          }
+        })
+      );
+    } catch { /* Circuit subscription can fail — proceed without appearance data */ }
 
     // Subscribe to events
     this.subscriptions.push(
@@ -169,7 +200,7 @@ export class SLBridge {
   // Update interpolation state from server and return smoothed position
   getPosition(): { x: number; y: number; z: number } | null {
     const raw = this.getRawPosition();
-    if (!raw) return this._displayPos;
+    if (!raw) return this._displayPos ? { ...this._displayPos } : null;
 
     const now = performance.now();
 
@@ -193,7 +224,7 @@ export class SLBridge {
       if (dt > 0.05) {
         // Smooth velocity with exponential moving average to avoid spikes
         const newVx = dx / dt, newVy = dy / dt, newVz = dz / dt;
-        const blend = 0.4; // blend new velocity (lower = smoother)
+        const blend = 0.3; // blend new velocity (lower = smoother, less jittery)
         this._velocity.x = this._velocity.x * (1 - blend) + newVx * blend;
         this._velocity.y = this._velocity.y * (1 - blend) + newVy * blend;
         this._velocity.z = this._velocity.z * (1 - blend) + newVz * blend;
@@ -204,10 +235,9 @@ export class SLBridge {
 
     if (this._displayPos) {
       const dt = (now - this._lastPosTime) / 1000;
-      const timeSinceUpdate = (now - this._lastServerUpdate) / 1000;
 
       // Client-side dead reckoning from active movement input
-      // SL walk speed ~3.2 m/s, fly speed ~16 m/s, run ~5 m/s
+      // SL walk speed ~3.2 m/s, fly speed ~16 m/s
       if (this._activeMove && dt > 0) {
         const moveSpeed = this._flying ? 16 : 3.2;
         const yaw = this._bodyYaw;
@@ -226,10 +256,25 @@ export class SLBridge {
         this._displayPos.z += mz * dt;
       }
 
-      // Lerp toward server position to correct drift
-      // While actively moving, dead reckoning dominates — only gently correct
-      // When stopped, snap quickly to server truth
-      const correctionSpeed = this._activeMove ? 0.3 : 8;
+      // Lerp toward server position to correct drift.
+      //
+      // Key insight: when we STOP moving, the server position is BEHIND us because
+      // server updates lag by ~100-300ms. If we immediately snap to server position,
+      // we bounce backward then forward as server catches up. Instead:
+      //
+      // - While moving: gentle correction (0.15) — dead reckoning dominates
+      // - Just stopped (0-1s): very gentle correction (0.5) — let server catch up
+      // - Stopped a while (1s+): moderate correction (3) — converge smoothly
+      //
+      // This prevents the "bounce back then forward" jank on key release.
+      let correctionSpeed: number;
+      if (this._activeMove) {
+        correctionSpeed = 0.15;
+      } else {
+        const timeSinceStop = (now - this._moveStopTime) / 1000;
+        // Ramp from 0.5 → 3 over 0.8 seconds after stopping
+        correctionSpeed = 0.5 + Math.min(1, timeSinceStop / 0.8) * 2.5;
+      }
       const t = 1 - Math.exp(-correctionSpeed * dt);
       this._displayPos.x += (this._serverPos.x - this._displayPos.x) * t;
       this._displayPos.y += (this._serverPos.y - this._displayPos.y) * t;
@@ -344,6 +389,28 @@ export class SLBridge {
     }
   }
 
+  getCloudParams(): { scrollRateX: number; scrollRateY: number; density1Z: number; density2Z: number; scale: number; shadow: number; colorR: number; colorG: number; colorB: number } | null {
+    if (!this.bot) return null;
+    try {
+      const env = this.bot.currentRegion.environment;
+      if (!env?.dayCycle) return null;
+      const sky = env.dayCycle;
+      return {
+        scrollRateX: sky.cloudScrollRate?.x ?? 0.05,
+        scrollRateY: sky.cloudScrollRate?.y ?? 0.03,
+        density1Z: sky.cloudPosDensity1?.z ?? 0.5,
+        density2Z: sky.cloudPosDensity2?.z ?? 0.3,
+        scale: sky.cloudScale ?? 0.4,
+        shadow: sky.cloudShadow ?? 0.5,
+        colorR: Math.round((sky.cloudColor?.x ?? 1) * 255),
+        colorG: Math.round((sky.cloudColor?.y ?? 1) * 255),
+        colorB: Math.round((sky.cloudColor?.z ?? 1) * 255),
+      };
+    } catch {
+      return null;
+    }
+  }
+
   // Set callback for region changes (called when we detect a new region)
   onRegionChange(cb: () => void): void {
     this._onRegionChange = cb;
@@ -424,18 +491,60 @@ export class SLBridge {
         let colorR = 128, colorG = 128, colorB = 128;
         let alpha: number | undefined;
         let fullbright: boolean | undefined;
+        let faceColors: [number, number, number, number][] | undefined;
         try {
           const te = prim.TextureEntry;
           if (te?.defaultTexture?.rgba) {
             const rgba = te.defaultTexture.rgba;
-            colorR = Math.round((rgba.r ?? rgba.x ?? 0.5) * 255);
-            colorG = Math.round((rgba.g ?? rgba.y ?? 0.5) * 255);
-            colorB = Math.round((rgba.b ?? rgba.z ?? 0.5) * 255);
-            const a = rgba.a ?? rgba.w;
+            colorR = Math.round((rgba.red ?? rgba.r ?? rgba.x ?? 0.5) * 255);
+            colorG = Math.round((rgba.green ?? rgba.g ?? rgba.y ?? 0.5) * 255);
+            colorB = Math.round((rgba.blue ?? rgba.b ?? rgba.z ?? 0.5) * 255);
+            const a = rgba.alpha ?? rgba.a ?? rgba.w;
             if (a !== undefined && a < 1) alpha = a;
           }
           if (te?.defaultTexture?.fullbright) fullbright = true;
+          // Extract per-face colors
+          if (te?.faces?.length > 0) {
+            faceColors = [];
+            for (let fi = 0; fi < te.faces.length; fi++) {
+              const face = te.faces[fi];
+              if (face?.rgba) {
+                const fc = face.rgba;
+                faceColors.push([
+                  Math.round((fc.red ?? fc.r ?? fc.x ?? 0.5) * 255),
+                  Math.round((fc.green ?? fc.g ?? fc.y ?? 0.5) * 255),
+                  Math.round((fc.blue ?? fc.b ?? fc.z ?? 0.5) * 255),
+                  fc.alpha ?? fc.a ?? fc.w ?? 1,
+                ]);
+              } else {
+                // Inherit from default
+                faceColors.push([colorR, colorG, colorB, alpha ?? 1]);
+              }
+            }
+          }
         } catch { /* keep defaults */ }
+
+        // Extract mesh UUID from extraParams
+        let meshUUID: string | undefined;
+        try {
+          const md = prim.extraParams?.meshData;
+          if (md && (md.type & 0x05) === 0x05) { // SculptType.Mesh = 5
+            const meshId = md.meshData?.toString();
+            if (meshId && meshId !== '00000000-0000-0000-0000-000000000000') {
+              meshUUID = meshId;
+            }
+          }
+        } catch { /* no mesh data */ }
+
+        // Extract prim shape params
+        const profileHollow = prim.ProfileHollow != null ? prim.ProfileHollow / 50000 : undefined;
+        const pathBegin = prim.PathBegin != null ? prim.PathBegin / 50000 : undefined;
+        const pathEnd = prim.PathEnd != null ? 1 - prim.PathEnd / 50000 : undefined;
+        const pathTwist = prim.PathTwist != null ? prim.PathTwist * Math.PI / 18000 : undefined;
+        const pathTwistBegin = prim.PathTwistBegin != null ? prim.PathTwistBegin * Math.PI / 18000 : undefined;
+        const pathTaperX = prim.PathTaperX != null ? prim.PathTaperX / 100 : undefined;
+        const pathTaperY = prim.PathTaperY != null ? prim.PathTaperY / 100 : undefined;
+
         return {
           uuid: prim.FullID?.toString() ?? '',
           name: prim.name || '',
@@ -453,6 +562,10 @@ export class SLBridge {
           rotX: worldRotX, rotY: worldRotY, rotZ: worldRotZ, rotW: worldRotW,
           colorR, colorG, colorB,
           alpha, fullbright,
+          faceColors,
+          meshUUID,
+          profileHollow, pathBegin, pathEnd,
+          pathTwist, pathTwistBegin, pathTaperX, pathTaperY,
         };
       };
 
@@ -694,6 +807,8 @@ export class SLBridge {
   stop(): void {
     if (!this.bot) return;
     this._activeMove = null;
+    this._moveStopTime = performance.now();
+    this._velocity = { x: 0, y: 0, z: 0 };
     const agent = this.bot.agent;
     agent.clearControlFlag(
       ControlFlags.AGENT_CONTROL_AT_POS | ControlFlags.AGENT_CONTROL_AT_NEG |
@@ -739,6 +854,18 @@ export class SLBridge {
   }
 
   // IM
+  async retrieveOfflineMessages(): Promise<void> {
+    if (!this.bot) return;
+    try {
+      const agentID = this.bot.agent.agentID;
+      const sessionID = this.bot.agent.sessionID;
+      if (!agentID || !sessionID) return;
+      const msg = new RetrieveInstantMessagesMessage();
+      msg.AgentData = { AgentID: agentID, SessionID: sessionID };
+      this.bot.currentRegion.circuit.sendMessage(msg, PacketFlags.Reliable);
+    } catch { /* Offline message retrieval can fail — not critical */ }
+  }
+
   async sendIM(to: string, message: string): Promise<void> {
     if (!this.bot) return;
     await this.bot.clientCommands.comms.sendInstantMessage(to, message);
@@ -923,6 +1050,25 @@ export class SLBridge {
     return this.avatarCache.getMeshBundle(uuid);
   }
 
+  // Avatar appearance data
+  getAvatarAppearance(uuid: string): AvatarAppearanceData | null {
+    return this.appearanceCache.get(uuid);
+  }
+
+  getAvatarBakedColors(uuid: string): BakedTextureColors | null {
+    return this.appearanceCache.getBakedColors(uuid);
+  }
+
+  // Scene mesh lookup
+  getSceneMesh(uuid: string): import('./avatar-cache.js').CachedMesh[] | null {
+    return this.meshCache.getMesh(uuid);
+  }
+
+  // Queue scene mesh downloads
+  triggerSceneMeshFetch(uuids: string[]): void {
+    this.meshCache.triggerFetch(uuids);
+  }
+
   // Periodic avatar mesh scan (call from tick at lower frequency)
   triggerAvatarMeshScan(): void {
     const now = performance.now();
@@ -959,6 +1105,8 @@ export class SLBridge {
     this._serverPos = null;
     this._displayPos = null;
     this.avatarCache.detach();
+    this.meshCache.detach();
+    this.appearanceCache.clear();
     if (this.bot) {
       try {
         await this.bot.close();

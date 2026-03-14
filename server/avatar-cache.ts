@@ -17,6 +17,7 @@ export interface CachedMesh {
   positions: Float32Array;   // flat xyz triples
   indices: Uint16Array;      // triangle indices
   normals: Float32Array;     // flat xyz triples (or empty)
+  attachmentPoint?: number;  // AttachmentPoint enum value (for avatar attachments)
 }
 
 export interface AvatarMeshBundle {
@@ -83,12 +84,16 @@ export class AvatarCache {
     const attachments = avatar.getAttachments();
     const meshUUIDs: string[] = [];
 
+    const attachPointMap = new Map<string, number>(); // meshUUID → attachmentPoint
     for (const [, obj] of attachments) {
       const md = obj.extraParams?.meshData;
       if (md && md.type === SculptType.Mesh) {
         const meshId = md.meshData.toString();
         if (meshId && meshId !== '00000000-0000-0000-0000-000000000000') {
           meshUUIDs.push(meshId);
+          if (obj.attachmentPoint !== undefined) {
+            attachPointMap.set(meshId, obj.attachmentPoint);
+          }
         }
       }
     }
@@ -116,6 +121,11 @@ export class AvatarCache {
           ?? mesh.lodLevels['high_lod'];
         if (lod) {
           const parsed = submeshesToCached(lod);
+          // Store attachment point on each mesh
+          const ap = attachPointMap.get(mid);
+          if (ap !== undefined) {
+            for (const m of parsed) m.attachmentPoint = ap;
+          }
           this.meshAssetCache.set(mid, parsed);
           allMeshes.push(...parsed);
         }
@@ -137,15 +147,32 @@ export class AvatarCache {
   }
 
   // Trigger a scan for all visible avatars (call periodically, e.g. every 10s)
+  // Also evicts stale entries for avatars no longer in region
   async scanAll(): Promise<void> {
     if (!this.bot) return;
     const region = this.bot.currentRegion;
     if (!region) return;
 
+    // Evict avatar bundles for avatars no longer in region
+    const activeUUIDs = new Set<string>();
     for (const [, avatar] of region.agents) {
       const uuid = avatar.getKey()?.toString() ?? '';
-      if (this.cache.has(uuid)) continue; // already have it
-      // Fire and forget — don't block tick
+      if (uuid) activeUUIDs.add(uuid);
+    }
+    for (const uuid of this.cache.keys()) {
+      if (!activeUUIDs.has(uuid)) this.cache.delete(uuid);
+    }
+    // Cap mesh asset cache at 500 entries
+    if (this.meshAssetCache.size > 500) {
+      const keys = [...this.meshAssetCache.keys()];
+      for (let i = 0; i < keys.length - 500; i++) {
+        this.meshAssetCache.delete(keys[i]);
+      }
+    }
+
+    for (const [, avatar] of region.agents) {
+      const uuid = avatar.getKey()?.toString() ?? '';
+      if (this.cache.has(uuid)) continue;
       this.scanAvatar(avatar).catch(() => {});
     }
   }

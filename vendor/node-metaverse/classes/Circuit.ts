@@ -506,9 +506,14 @@ export class Circuit
         const waiting = this.awaitingAck.get(sequenceNumber);
         if (waiting)
         {
-            const toResend: Packet = waiting.packet;
-            toResend.packetFlags = toResend.packetFlags | PacketFlags.Resent;
-            this.sendPacket(toResend);
+            try {
+                const toResend: Packet = waiting.packet;
+                toResend.packetFlags = toResend.packetFlags | PacketFlags.Resent;
+                this.sendPacket(toResend);
+            } catch (e) {
+                // Drop packet on resend failure — better than crashing
+                this.awaitingAck.delete(sequenceNumber);
+            }
         }
     }
 

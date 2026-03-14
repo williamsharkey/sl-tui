@@ -11,6 +11,8 @@ export interface InputCallbacks {
   onToggleFly: () => void;
   onToggleDither: () => void;
   onToggleRenderMode: () => void;
+  onToggleCameraMode: () => void;
+  onCameraOrbit: (dir: 'up' | 'down' | 'left' | 'right') => void;
   onTurnLeft: () => void;
   onTurnRight: () => void;
   onEnterChat: () => void;
@@ -97,6 +99,17 @@ export class InputHandler {
   private handleGridKey(str: string | undefined, key: readline.Key): void {
     // Body-relative: up=forward, down=back, left=turn left, right=turn right
     // a/d = strafe left/right, space = jump
+    // Shift+Up/Down = fly altitude
+    if (key.shift && key.name === 'up') {
+      this.callbacks.onMove('up');
+      this.scheduleStop();
+      return;
+    }
+    if (key.shift && key.name === 'down') {
+      this.callbacks.onMove('down');
+      this.scheduleStop();
+      return;
+    }
     if (key.name === 'up') {
       this.callbacks.onMove('forward');
       this.scheduleStop();
@@ -131,12 +144,22 @@ export class InputHandler {
     } else if (str === ' ') {
       this.callbacks.onMove('up');
       this.scheduleStop();
+    } else if (str === 'i' || str === 'I') {
+      this.callbacks.onCameraOrbit('up');
+    } else if (str === 'k' || str === 'K') {
+      this.callbacks.onCameraOrbit('down');
+    } else if (str === 'j' || str === 'J') {
+      this.callbacks.onCameraOrbit('left');
+    } else if (str === 'l' || str === 'L') {
+      this.callbacks.onCameraOrbit('right');
     } else if (str === 'f' || str === 'F') {
       this.callbacks.onToggleFly();
     } else if (str === 'v' || str === 'V') {
       this.callbacks.onToggleDither();
     } else if (str === 'r' || str === 'R') {
       this.callbacks.onToggleRenderMode();
+    } else if (str === 'c' || str === 'C') {
+      this.callbacks.onToggleCameraMode();
     } else if (key.name === 'return') {
       this.callbacks.onEnterChat();
     } else if (str === '/' || key.name === 'tab') {

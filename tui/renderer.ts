@@ -18,6 +18,13 @@ const ALT_SCREEN_OFF = `${ESC}?1049l`;
 const RESET = `${ESC}0m`;
 const RESET_BG = `${ESC}49m`; // reset bg to default terminal bg
 
+// Synchronized output: tells terminal to buffer all writes and display atomically
+// Prevents horizontal tearing from partial frame updates
+const SYNC_START = `${ESC}?2026h`;
+const SYNC_END = `${ESC}?2026l`;
+
+export { SYNC_START, SYNC_END };
+
 function moveTo(row: number, col: number): string {
   return `${ESC}${row + 1};${col + 1}H`;
 }
@@ -124,10 +131,12 @@ export function renderStatusBarBuf(
   region: string,
   pos: { x: number; y: number; z: number } | null,
   flying: boolean,
+  imSummary?: string | null,
 ): string {
   const posStr = pos ? `(${pos.x.toFixed(0)}, ${pos.y.toFixed(0)}, ${pos.z.toFixed(0)})` : '(?,?,?)';
   const flyStr = flying ? ' [FLY]' : '';
-  const status = ` ${region} ${posStr}${flyStr} `;
+  const imStr = imSummary ? ` | ${imSummary}` : '';
+  const status = ` ${region} ${posStr}${flyStr}${imStr} `;
   const padded = status.padEnd(layout.totalCols);
 
   if (_bwMode) {

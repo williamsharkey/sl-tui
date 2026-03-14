@@ -1,7 +1,8 @@
 // types.ts — ISLBridge interface and WritableTarget for TUI
 
 import type { AvatarData, ObjectData } from '../server/grid-state.js';
-import type { AvatarMeshBundle } from '../server/avatar-cache.js';
+import type { AvatarMeshBundle, CachedMesh } from '../server/avatar-cache.js';
+import type { AvatarAppearanceData, BakedTextureColors } from '../server/avatar-appearance.js';
 
 export interface WritableTarget {
   write(data: string): void;
@@ -37,6 +38,7 @@ export interface ISLBridge {
   whisper(message: string): Promise<void>;
   shout(message: string): Promise<void>;
   sendIM(to: string, message: string): Promise<void>;
+  retrieveOfflineMessages?(): Promise<void>;
   searchPeople(query: string): Promise<{ name: string; uuid: string }[]>;
   sendFriendRequest(to: string, message: string): Promise<void>;
   acceptFriendRequest(fromUuid: string): Promise<void>;
@@ -60,6 +62,10 @@ export interface ISLBridge {
   triggerAvatarMeshScan(): void;
   getSkyColors(): { zenith: [number, number, number]; horizon: [number, number, number]; sunDir: [number, number, number] } | null;
   getAvatarMeshBundle(uuid: string): AvatarMeshBundle | null;
+  getAvatarAppearance?(uuid: string): AvatarAppearanceData | null;
+  getAvatarBakedColors?(uuid: string): BakedTextureColors | null;
+  getSceneMesh?(uuid: string): CachedMesh[] | null;
+  triggerSceneMeshFetch?(uuids: string[]): void;
   startTick(callback: () => void, hz?: number): void;
   stopTick(): void;
   close(): Promise<void>;
